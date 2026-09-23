@@ -44,6 +44,14 @@ static_assert(sizeof(struct htp_unary_kernel_params) <= 128, "htp_unary_kernel_p
 _Static_assert(sizeof(struct htp_unary_kernel_params) <= 128, "htp_unary_kernel_params is too large for kernel_params blob");
 #endif
 
+// HTP_OP_GDN_GATE
+struct htp_gdn_gate_kernel_params {
+    uint32_t n_threads;
+    uint32_t nrows;
+    uint32_t nrows_per_thread;
+    uint32_t ne0;
+};
+
 static inline bool htp_op_is_unary(uint32_t opcode) {
     switch (opcode) {
         case HTP_OP_CLAMP:

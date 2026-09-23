@@ -4665,6 +4665,72 @@ struct test_rms_norm_mul_silu : public test_case {
     }
 };
 
+// gated delta net gate: MUL(SOFTPLUS(ADD(alpha, dt_bias)), A), optionally with SIGMOID(beta) right after it
+struct test_gdn_gate : public test_case {
+    const ggml_type type;
+    const int64_t n_h;
+    const int64_t n_t;
+    const int64_t n_s;
+    const bool sigmoid;
+    const bool sigmoid_of_gate; // SIGMOID reads the gate output, must not be absorbed
+
+    ggml_tensor * gate_node = nullptr;
+    ggml_tensor * beta_node = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (sigmoid) {
+            return { gate_node, beta_node };
+        }
+        return { gate_node };
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, n_h, n_t, n_s, sigmoid, sigmoid_of_gate);
+    }
+
+    test_gdn_gate(ggml_type type = GGML_TYPE_F32, int64_t n_h = 16, int64_t n_t = 4, int64_t n_s = 1,
+                  bool sigmoid = false, bool sigmoid_of_gate = false)
+        : type(type), n_h(n_h), n_t(n_t), n_s(n_s), sigmoid(sigmoid), sigmoid_of_gate(sigmoid_of_gate) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * alpha = ggml_new_tensor_3d(ctx, type, n_h, n_t, n_s);
+        ggml_tensor * dt    = ggml_new_tensor_1d(ctx, type, n_h);
+        ggml_tensor * a     = ggml_new_tensor_1d(ctx, type, n_h);
+        ggml_set_name(alpha, "alpha");
+        ggml_set_name(dt,    "dt");
+        ggml_set_name(a,     "a");
+
+        gate_node = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), a);
+        ggml_set_name(gate_node, "gate");
+        if (!sigmoid) {
+            return gate_node;
+        }
+        if (sigmoid_of_gate) {
+            beta_node = ggml_sigmoid(ctx, gate_node);
+            ggml_set_name(beta_node, "gate_sigmoid");
+            ggml_tensor * out = ggml_add(ctx, gate_node, beta_node);
+            ggml_set_name(out, "out");
+            return out;
+        }
+
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, type, 1, n_h, n_t, n_s);
+        ggml_set_name(beta, "beta");
+        beta_node = ggml_sigmoid(ctx, beta);
+        ggml_set_name(beta_node, "beta_sigmoid");
+
+        // sink that reads both outputs, after the SIGMOID
+        ggml_tensor * out = ggml_add(ctx, gate_node, ggml_reshape_3d(ctx, beta_node, n_h, n_t, n_s));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -10101,6 +10167,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_silu(128, 16, 1024, 2, 1));
     test_cases.emplace_back(new test_rms_norm_mul_silu(72, 3, 5, 1, 0));
     test_cases.emplace_back(new test_rms_norm_mul_silu(72, 3, 5, 1, 1));
+    for (int64_t n_t : {1, 128}) {
+        test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F32, 16, n_t, 1, false));
+        for (int64_t n_s : {1, 2}) {
+            test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F32, 16, n_t, n_s, true)); // Qwen3.5 0.8B
+        }
+    }
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F32, 16, 4, 2, true));
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F32, 48, 3, 1, true));
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F32, 16, 1, 1, true, true));
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F32, 16, 128, 1, true, true));
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 32, 4)); // Mamba-2

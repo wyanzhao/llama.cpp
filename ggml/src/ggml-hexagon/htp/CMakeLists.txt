@@ -24,6 +24,7 @@ add_library(${HTP_LIB} SHARED
     matmul-ops.c
     flash-attn-ops.c
     gated-delta-net-ops.c
+    gdn-gate-ops.c
     binary-ops.c
     unary-ops.c
     sum-rows-ops.c

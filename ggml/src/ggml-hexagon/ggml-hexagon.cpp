@@ -124,6 +124,7 @@ enum ggml_hexagon_fusion_flags {
     GGML_HEXAGON_FUSE_SSM_CONV_CHAIN = (1 << 7), // 128
     GGML_HEXAGON_FUSE_SSM_CONV_CHAIN_QK_NORM = (1 << 8), // 256, needs 128
     GGML_HEXAGON_FUSE_NORM_GATED     = (1 << 9), // 512
+    GGML_HEXAGON_FUSE_GDN_GATE      = (1 << 10), // 1024
 };
 
 static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
@@ -3324,6 +3325,141 @@ struct ggml_hexagon_opbatch {
         return true;
     }
 
+    // GDN gate: ADD(alpha, dt_bias) + SOFTPLUS + MUL(A) [+ SIGMOID(beta)] -> GDN_GATE.
+    // Built in stages since try_fuse() only sees the previous op; each stage is a valid GDN_GATE.
+    bool try_fuse_gdn_gate(const htp_opnode & node) {
+        if (n_ops == 0 || sess->mdev.count > 1) return false;
+
+        htp_opnode & last_node = ops[n_ops - 1];
+
+        auto is_row_bcast = [](const ggml_tensor * w, const ggml_tensor * ref) {
+            return w && w->type == GGML_TYPE_F32 && w->ne[0] == ref->ne[0] && w->ne[1] == 1 && w->ne[2] == 1 &&
+                   w->ne[3] == 1 && ggml_is_contiguous(w);
+        };
+        auto is_f32_contig = [](const ggml_tensor * t) {
+            return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
+        };
+
+        if (node.opcode == HTP_OP_UNARY_SOFTPLUS && last_node.opcode == HTP_OP_ADD) {
+            const ggml_tensor * add_dst = last_node.dst();
+            const ggml_tensor * a       = last_node.src0();
+            const ggml_tensor * b       = last_node.src1();
+            const ggml_tensor * sp_dst  = node.dst();
+
+            if (node.src0() != add_dst || !ggml_hexagon_tensor_is_fuseable(add_dst)) return false;
+            if (!is_f32_contig(a) || !is_f32_contig(add_dst) || !is_f32_contig(sp_dst)) return false;
+            if (!ggml_are_same_shape(a, add_dst) || !ggml_are_same_shape(sp_dst, add_dst)) return false;
+            if (!is_row_bcast(b, a)) return false;
+            if (ggml_hexagon_tensors_overlap(sp_dst, a) || ggml_hexagon_tensors_overlap(sp_dst, b)) return false;
+            if (!try_fuse_common(a, sp_dst)) return false;
+
+            last_node.opcode  = HTP_OP_GDN_GATE;
+            last_node.name    = "GDN_GATE";
+            last_node.inputs  = { a, b };
+            last_node.outputs = { sp_dst };
+            last_node.fused.push_back(node.node);
+            memset(last_node.kernel_params, 0, sizeof(last_node.kernel_params));
+
+            auto * kp = (struct htp_gdn_gate_kernel_params *) last_node.kernel_params;
+            kp->ne0              = (uint32_t) a->ne[0];
+            kp->nrows            = (uint32_t) ggml_nrows(a);
+            kp->n_threads        = std::max<uint32_t>(1, std::min<uint32_t>(sess->n_threads, kp->nrows));
+            kp->nrows_per_thread = (kp->nrows + kp->n_threads - 1) / kp->n_threads;
+
+            htp_op_desc & o = h_ops[n_ops - 1];
+            o.opcode = HTP_OP_GDN_GATE;
+            memcpy(o.kernel_params, last_node.kernel_params, sizeof(o.kernel_params));
+            o.src[0] = add_tensor(a);
+            o.src[1] = add_tensor(b);
+            for (uint32_t i = 2; i < HTP_OP_MAX_INPUTS; i++) {
+                o.src[i] = 0xffff;
+            }
+            o.dst[0] = add_tensor(sp_dst);
+            for (uint32_t i = 1; i < HTP_OP_MAX_OUTPUTS; i++) {
+                o.dst[i] = 0xffff;
+            }
+
+            HEX_VERBOSE("ggml-hex: %s fused GDN_GATE (#%u)\n", sess->c_name(), n_ops - 1);
+            return true;
+        }
+
+        if (node.opcode == HTP_OP_MUL && last_node.opcode == HTP_OP_GDN_GATE && last_node.inputs.size() == 2) {
+            const ggml_tensor * sp_dst  = last_node.dst();
+            const ggml_tensor * mul_dst = node.dst();
+            const ggml_tensor * w;
+
+            if (node.src0() == sp_dst) {
+                w = node.src1();
+            } else if (node.src1() == sp_dst) {
+                w = node.src0();
+            } else {
+                return false;
+            }
+
+            if (!ggml_hexagon_tensor_is_fuseable(sp_dst)) return false;
+            if (!is_f32_contig(mul_dst) || !ggml_are_same_shape(mul_dst, sp_dst)) return false;
+            if (!is_row_bcast(w, sp_dst)) return false;
+            // the fused op writes mul_dst while it reads its inputs
+            for (const ggml_tensor * t : { last_node.inputs[0], last_node.inputs[1], w }) {
+                if (ggml_hexagon_tensors_overlap(mul_dst, t)) return false;
+            }
+            if (!try_fuse_common(w, mul_dst)) return false;
+
+            last_node.name = "GDN_GATE+MUL";
+            last_node.inputs.push_back(w);
+            last_node.outputs = { mul_dst };
+            last_node.fused.push_back(node.node);
+
+            htp_op_desc & o = h_ops[n_ops - 1];
+            o.src[2] = add_tensor(w);
+            o.dst[0] = add_tensor(mul_dst);
+
+            HEX_VERBOSE("ggml-hex: %s fused GDN_GATE+MUL (#%u)\n", sess->c_name(), n_ops - 1);
+            return true;
+        }
+
+        // absorb a SIGMOID that follows the gate as the op's second output (Qwen3.5: SIGMOID(beta))
+        if (node.opcode == HTP_OP_UNARY_SIGMOID && last_node.opcode == HTP_OP_GDN_GATE &&
+            last_node.inputs.size() == 3 &&
+            last_node.outputs.size() == 1) {
+            const ggml_tensor * beta     = node.src0();
+            const ggml_tensor * beta_dst = node.dst();
+            const ggml_tensor * gate_dst = last_node.dst();
+            const int64_t       n        = ggml_nelements(gate_dst);
+
+            if (!is_f32_contig(beta) || !is_f32_contig(beta_dst) || ggml_nelements(beta) != n ||
+                ggml_nelements(beta_dst) != n) {
+                return false;
+            }
+            // an output may only sit exactly on an input: the kernel reads each chunk before it writes it
+            auto alias_ok = [](const ggml_tensor * out, const ggml_tensor * in) {
+                return !ggml_hexagon_tensors_overlap(out, in) || (out->data == in->data &&
+                                                                  ggml_nbytes(out) == ggml_nbytes(in));
+            };
+            // the SIGMOID must not read the gate output: the fused op computes both outputs from the inputs
+            if (ggml_hexagon_tensors_overlap(beta_dst, gate_dst)) return false;
+            if (ggml_hexagon_tensors_overlap(beta, gate_dst)) return false;
+            for (const ggml_tensor * t : { last_node.inputs[0], last_node.inputs[1], last_node.inputs[2], beta }) {
+                if (!alias_ok(gate_dst, t) || !alias_ok(beta_dst, t)) return false;
+            }
+            if (!try_fuse_common(beta, beta_dst)) return false;
+
+            last_node.name += "+SIGMOID";
+            last_node.inputs.push_back(beta);
+            last_node.outputs.push_back(beta_dst);
+            last_node.fused.push_back(node.node);
+
+            htp_op_desc & o = h_ops[n_ops - 1];
+            o.src[3] = add_tensor(beta);
+            o.dst[1] = add_tensor(beta_dst);
+
+            HEX_VERBOSE("ggml-hex: %s fused GDN_GATE+SIGMOID (#%u)\n", sess->c_name(), n_ops - 1);
+            return true;
+        }
+
+        return false;
+    }
+
     bool try_fuse(const htp_opnode & node) {
         if (!opt_opfusion) return false;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_ALLREDUCE_ADD) && try_fuse_allreduce_add(node)) return true;
@@ -3333,6 +3469,7 @@ struct ggml_hexagon_opbatch {
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ID_NX) && try_fuse_mul_mat_id_nx(node)) return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_GDN_CPY)       && try_fuse_gdn_cpy(node))       return true;
         if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_NORM_GATED)    && try_fuse_rms_norm_mul_silu(node)) return true;
+        if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_GDN_GATE)      && try_fuse_gdn_gate(node))      return true;
         return false;
     }
 };
@@ -6783,6 +6920,17 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                 if (ggml_node_has_n_uses(graph, i, 1)) {
                     extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
                 }
+            } else if (graph->nodes[i]->op == GGML_OP_ADD &&
+                       ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_GDN_GATE) &&
+                       ggml_can_fuse(graph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }) &&
+                       ggml_get_unary_op(graph->nodes[i + 1]) == GGML_UNARY_OP_SOFTPLUS) {
+                // the ADD and SOFTPLUS of the GDN gate
+                extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
+                auto * sp_extra = (ggml_hexagon_tensor_extra *) graph->nodes[i + 1]->extra;
+                if (sp_extra) {
+                    sp_extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
+                }
+                i++;
             } else if (graph->nodes[i]->op == GGML_OP_MUL_MAT || graph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
                 if ((i + 1 < graph->n_nodes && graph->nodes[i + 1]->op == GGML_OP_ADD && ggml_can_fuse(graph, i, { graph->nodes[i]->op, GGML_OP_ADD })) ||
                     ggml_node_has_n_uses(graph, i, 1)) {
