@@ -9,6 +9,7 @@
 #include <hexagon_types.h>
 #include <math.h>
 #include <qurt_thread.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #define GGML_COMMON_DECL_C
@@ -493,4 +494,312 @@ int op_ssm_conv(struct htp_ops_context * octx) {
         default:
             return HTP_STATUS_NO_SUPPORT;
     }
+}
+
+// Fused CONCAT + CPY + SSM_CONV + SILU (HTP_OP_SSM_CONV_CHAIN). The concat is never built: qkv tiles go by DMA
+// into the conv input tile in VTCM, and the new conv state comes from the last n_state columns of that tile.
+
+struct htp_ssm_conv_chain_context {
+    struct htp_ops_context *                        octx;
+    const struct htp_ssm_conv_chain_kernel_params * kparams;
+    atomic_uint                                     state_barrier;
+};
+
+// Tap-major {n_rows, T_stride} -> channel-major {tile_n, n_rows}
+static inline void hvx_ssm_conv_scatter_from_T(const float * T, uint32_t T_stride, uint32_t n_rows, float * out,
+                                               uint32_t tile_n) {
+    for (uint32_t j = 0; j < n_rows; ++j) {
+        const float * src = T + (size_t) j * T_stride;
+        float *       dst = out + j;
+        for (uint32_t cb = 0; cb < tile_n; cb += VLEN_FP32) {
+            const uint32_t cb_n = MIN(VLEN_FP32, tile_n - cb);
+            HVX_Vector     v    = *(const HVX_Vector *) (src + cb);
+            for (uint32_t c = 0; c < cb_n; ++c) {
+                const HVX_Vector r = Q6_V_vror_VR(v, c * (uint32_t) sizeof(float));
+                hvx_vec_store_u(dst + (size_t) (cb + c) * n_rows, sizeof(float), r);
+            }
+        }
+    }
+}
+
+static inline void ssm_conv_chain_push_state_in(dma_queue * dma_q, const struct htp_tensor * st_in,
+                                                const struct htp_ssm_conv_chain_kernel_params * kp,
+                                                float * stage, uint32_t seq, uint32_t ch0, uint32_t n) {
+    const size_t bytes = (size_t) n * kp->n_state * sizeof(float);
+    float * dst = stage + (size_t) seq * kp->n_state * kp->d_inner_per_thread;
+    const size_t     off = (size_t) seq * kp->st_in_seq_stride + (size_t) ch0 * kp->n_state * sizeof(float);
+    const dma_addr_t src = st_in->data + off;
+    dma_queue_push(dma_q, dma_make_data((uint8_t *) dst, src), bytes, bytes, bytes, 1);
+}
+
+// n_t rows of tile_n channels into rows [n_state, ncs) of the conv input tile
+static inline void ssm_conv_chain_push_in(dma_queue * dma_q, const struct htp_tensor * qkv,
+                                          const struct htp_ssm_conv_chain_kernel_params * kp,
+                                          uint8_t * buf, uint32_t seq, uint32_t ch0, uint32_t tile_n) {
+    float * xt = (float *) buf;
+    dma_queue_push(dma_q,
+                   dma_make_data((uint8_t *) (xt + (size_t) kp->n_state * kp->d_inner_tile),
+                                 qkv->data + (size_t) seq * kp->qkv_seq_stride + (size_t) ch0 * sizeof(float)),
+                   (size_t) kp->d_inner_tile * sizeof(float), qkv->nb[0], (size_t) tile_n * sizeof(float), kp->n_t);
+}
+
+// two descriptors per tile: the conv output and the new conv state
+static inline void ssm_conv_chain_push_out(dma_queue * dma_q, const struct htp_tensor * dst, const struct htp_tensor * st_out,
+                                           const struct htp_ssm_conv_chain_kernel_params * kp,
+                                           uint8_t * buf, uint8_t * dst_tile, uint32_t seq, uint32_t ch0, uint32_t tile_n) {
+    const size_t state_bytes = (size_t) tile_n * kp->n_state * sizeof(float);
+    float * state_out = (float *) (buf + kp->vtcm_xt_bytes);
+
+    dma_queue_push(dma_q,
+                   dma_make_data(dst->data + (size_t) seq * kp->dst_seq_stride + (size_t) ch0 * sizeof(float), dst_tile),
+                   dst->nb[1], (size_t) kp->d_inner_tile * sizeof(float), (size_t) tile_n * sizeof(float), kp->n_t);
+    dma_queue_push(dma_q,
+                   dma_make_data(st_out->data + (size_t) seq * kp->st_out_seq_stride + (size_t) ch0 * kp->n_state * sizeof(float), (uint8_t *) state_out),
+                   state_bytes, state_bytes, state_bytes, 1);
+}
+
+// In-place silu over n_rows rows of the VTCM tile, same calls as HTP_OP_UNARY_SILU (scratch holds one row).
+// Out of line on purpose: inlined, the compiler schedules it differently and the result is not bit-identical.
+static void __attribute__((noinline)) ssm_conv_chain_silu(uint8_t * restrict tile, uint8_t * restrict scratch,
+                                                          uint32_t n_rows, uint32_t row_stride, uint32_t n) {
+    for (uint32_t r = 0; r < n_rows; r++) {
+        uint8_t * row = tile + (size_t) r * row_stride;
+        hvx_sigmoid_f32_aa(scratch, row, n);
+        hvx_mul_f32_aaa(row, row, scratch, n);
+    }
+}
+
+// tile index -> (sequence, channel offset, channel count)
+static inline void ssm_conv_chain_tile(uint32_t idx, uint32_t n_tiles_seq, uint32_t d_inner_tile, uint32_t d_inner_per_thread,
+                                       uint32_t * seq, uint32_t * tile_off, uint32_t * tile_n) {
+    const uint32_t s = idx / n_tiles_seq;
+    const uint32_t o = (idx - s * n_tiles_seq) * d_inner_tile;
+    *seq      = s;
+    *tile_off = o;
+    *tile_n   = MIN(d_inner_tile, d_inner_per_thread - o);
+}
+
+static void ssm_conv_chain_thread_f32(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_ssm_conv_chain_context *                      ccctx = (struct htp_ssm_conv_chain_context *) data;
+    struct htp_ops_context *                                 octx  = ccctx->octx;
+    const struct htp_ssm_conv_chain_kernel_params * restrict kp    = ccctx->kparams;
+
+    const struct htp_tensor * restrict st_in  = octx->src[0];
+    const struct htp_tensor * restrict qkv    = octx->src[1];
+    const struct htp_tensor * restrict wgt    = octx->src[2];
+    const struct htp_tensor * restrict dst    = octx->dsts[0];
+    const struct htp_tensor * restrict st_out = octx->dsts[1];
+
+    dma_queue * dma_q = octx->ctx->dma[ith];
+
+    const uint32_t d_conv       = kp->d_conv;
+    const uint32_t n_state      = kp->n_state;
+    const uint32_t n_t          = kp->n_t;
+    const uint32_t ncs          = kp->ncs;
+    const uint32_t d_inner_tile = kp->d_inner_tile;
+
+    const uint32_t dr  = kp->d_inner_per_thread;
+    const uint32_t ir0 = dr * ith;
+    if (ir0 >= kp->d_inner) {
+        atomic_fetch_sub(&ccctx->state_barrier, 1);
+        return;
+    }
+    const uint32_t ir1 = MIN(ir0 + dr, kp->d_inner);
+
+    const uint32_t d_inner_per_thread = ir1 - ir0;
+    const uint32_t d_inner_stride     = hex_round_up(d_inner_per_thread, VLEN_FP32);
+
+    uint8_t * src0_spad_base = octx->src0_spad.data + ith * octx->src0_spad.size_per_thread;
+    float *   state_stage    = (float *) src0_spad_base;
+    uint8_t * tile_spad_base = src0_spad_base + kp->vtcm_state_stage_bytes;
+    uint8_t * src1_spad_base = octx->src1_spad.data + ith * octx->src1_spad.size_per_thread;
+    uint8_t * dst_spad_base  = octx->dst_spad.data  + ith * octx->dst_spad.size_per_thread;
+
+    const size_t weight_bytes = (size_t) d_inner_per_thread * d_conv * sizeof(float);
+
+    float * wgt_raw = (float *) src1_spad_base;
+    float * wgt_T   = (float *) (src1_spad_base + hex_round_up(weight_bytes, 128));
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+
+    dma_queue_push(dma_q, dma_make_data((uint8_t *) wgt_raw, wgt->data + (size_t) ir0 * d_conv * sizeof(float)),
+                   weight_bytes, weight_bytes, weight_bytes, 1);
+    dma_queue_pop(dma_q);
+
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) ir0);
+    hvx_ssm_conv_unpack_to_T(wgt_raw, wgt_T, d_inner_per_thread, d_inner_stride, d_conv);
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) ir0);
+
+    // Ring order (one ring per thread, strict FIFO):
+    //   push  st(0..n_s-1) in0 in1 | out0 in2 | out1 in3 | ... | out(n-1)
+    //   pop   st(0..n_s-1) | in0 | in1 out0 | in2 out1 | ... | out(n-1)
+    const uint32_t n_tiles_seq = (d_inner_per_thread + d_inner_tile - 1) / d_inner_tile;
+    const uint32_t n_tiles     = n_tiles_seq * kp->n_s;
+    const uint32_t n_buf       = MIN(kp->n_buf, n_tiles);
+
+    // dst[0] may be allocated on top of src[0], so the whole conv state is staged before any output DMA
+    for (uint32_t s = 0; s < kp->n_s; ++s) {
+        ssm_conv_chain_push_state_in(dma_q, st_in, kp, state_stage, s, ir0, d_inner_per_thread);
+    }
+
+    uint32_t p_seq = 0, p_off = 0, p_n = 0;
+    ssm_conv_chain_tile(0, n_tiles_seq, d_inner_tile, d_inner_per_thread, &p_seq, &p_off, &p_n);
+    ssm_conv_chain_push_in(dma_q, qkv, kp, tile_spad_base, p_seq, ir0 + p_off, p_n);
+    if (n_tiles > 1) {
+        ssm_conv_chain_tile(1, n_tiles_seq, d_inner_tile, d_inner_per_thread, &p_seq, &p_off, &p_n);
+        ssm_conv_chain_push_in(dma_q, qkv, kp, tile_spad_base + (1 % n_buf) * kp->vtcm_buf_stride, p_seq, ir0 + p_off, p_n);
+    }
+
+    for (uint32_t s = 0; s < kp->n_s; ++s) {
+        dma_queue_pop(dma_q);
+    }
+
+    // rings are per thread, so wait until every thread has staged its conv state
+    atomic_fetch_sub(&ccctx->state_barrier, 1);
+    while (atomic_load(&ccctx->state_barrier) > 0) {
+    }
+
+    for (uint32_t i = 0; i < n_tiles; ++i) {
+        uint32_t seq = 0, tile_off = 0, tile_n = 0;
+        ssm_conv_chain_tile(i, n_tiles_seq, d_inner_tile, d_inner_per_thread, &seq, &tile_off, &tile_n);
+        const uint32_t ch0 = ir0 + tile_off;
+
+        uint8_t * buf       = tile_spad_base + (i % n_buf) * kp->vtcm_buf_stride;
+        float *   xt        = (float *) buf;
+        float *   state_out = (float *) (buf + kp->vtcm_xt_bytes);
+        float *   dst_tile  = (float *) (dst_spad_base + (i % n_buf) * kp->vtcm_dst_tile_bytes);
+
+        dma_queue_pop(dma_q);
+
+        const float * stage = state_stage + (size_t) seq * n_state * kp->d_inner_per_thread;
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) tile_off);
+        hvx_ssm_conv_unpack_to_T(stage + (size_t) tile_off * n_state, xt, tile_n, d_inner_tile, n_state);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) tile_off);
+
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) tile_off);
+        for (uint32_t t = 0; t < n_t; ++t) {
+            for (uint32_t cb = 0; cb < tile_n; cb += VLEN_FP32) {
+                const uint32_t cb_n = MIN(VLEN_FP32, tile_n - cb);
+
+                HVX_Vector acc = hvx_vec_splat_f32(0.0f);
+                for (uint32_t j = 0; j < d_conv; ++j) {
+                    HVX_Vector x = *(const HVX_Vector *) (xt + (size_t) (t + j) * d_inner_tile + cb);
+                    HVX_Vector w = *(const HVX_Vector *) (wgt_T + (size_t) j * d_inner_stride + tile_off + cb);
+                    acc          = Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vmpy_VsfVsf(x, w));
+                }
+
+                HVX_Vector y = Q6_Vsf_equals_Vqf32(acc);
+
+                float * dst_tile_ptr = dst_tile + (size_t) t * d_inner_tile + cb;
+                if (cb_n == VLEN_FP32) {
+                    *(HVX_Vector *) dst_tile_ptr = y;
+                } else {
+                    hvx_vec_store_u(dst_tile_ptr, cb_n * sizeof(float), y);
+                }
+            }
+        }
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) tile_off);
+
+        // a separate pass hides the sigmoid latency better than an accumulator epilogue
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_GDN_OUT, (uint16_t) tile_off);
+        ssm_conv_chain_silu((uint8_t *) dst_tile, (uint8_t *) state_out, n_t, d_inner_tile * sizeof(float), tile_n);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_OUT, (uint16_t) tile_off);
+
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) tile_off);
+        hvx_ssm_conv_scatter_from_T(xt + (size_t) (ncs - n_state) * d_inner_tile, d_inner_tile, n_state, state_out, tile_n);
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) tile_off);
+
+        ssm_conv_chain_push_out(dma_q, dst, st_out, kp, buf, (uint8_t *) dst_tile, seq, ch0, tile_n);
+
+        if (i + 2 < n_tiles) {
+            uint32_t n_seq = 0, n_off = 0, n_n = 0;
+            ssm_conv_chain_tile(i + 2, n_tiles_seq, d_inner_tile, d_inner_per_thread, &n_seq, &n_off, &n_n);
+            ssm_conv_chain_push_in(dma_q, qkv, kp, tile_spad_base + ((i + 2) % n_buf) * kp->vtcm_buf_stride, n_seq, ir0 + n_off, n_n);
+        }
+
+        if (i >= 1) {
+            dma_queue_pop(dma_q);
+            dma_queue_pop(dma_q);
+        }
+    }
+
+    dma_queue_pop(dma_q);
+    dma_queue_pop(dma_q);
+
+    FARF(HIGH, "ssm-conv-chain-f32 %d/%d: (%u:%u) state %ux%u x qkv %ux%u -> %ux%u + state %u\n",
+         ith, nth, ir0, ir1, st_in->ne[0], st_in->ne[1], qkv->ne[0], qkv->ne[1], dst->ne[0], dst->ne[1], st_out->ne[0]);
+}
+
+int op_ssm_conv_chain(struct htp_ops_context * octx) {
+    const struct htp_tensor * st_in  = octx->src[0];
+    const struct htp_tensor * qkv    = octx->src[1];
+    const struct htp_tensor * wgt    = octx->src[2];
+    const struct htp_tensor * dst    = octx->dsts[0];
+    const struct htp_tensor * st_out = octx->dsts[1];
+
+    if (st_in->type != HTP_TYPE_F32 || qkv->type != HTP_TYPE_F32 || wgt->type != HTP_TYPE_F32 ||
+        dst->type != HTP_TYPE_F32 || st_out->type != HTP_TYPE_F32) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+    if (octx->ctx->mdev.count > 1) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    const struct htp_ssm_conv_chain_kernel_params * kparams = (const struct htp_ssm_conv_chain_kernel_params *) octx->kernel_params;
+
+    if (kparams->d_conv == 0 || kparams->d_conv > 32 || kparams->n_state + 1 != kparams->d_conv ||
+        kparams->d_inner == 0 || kparams->n_t == 0 || kparams->n_s == 0 || kparams->d_inner_tile == 0 ||
+        kparams->ncs != kparams->n_t + kparams->n_state) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+    if (kparams->n_s != dst->ne[2] || kparams->n_t != dst->ne[1] || kparams->d_inner != dst->ne[0]) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+    if (kparams->n_s > 1 && (kparams->st_in_seq_stride == 0 || kparams->qkv_seq_stride == 0 ||
+                             kparams->dst_seq_stride == 0 || kparams->st_out_seq_stride == 0)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    // more than one tile needs two buffers, or the look-ahead DMA overwrites the tile in use
+    const uint32_t n_tiles_seq = (kparams->d_inner_per_thread + kparams->d_inner_tile - 1) / kparams->d_inner_tile;
+    if (kparams->n_buf == 0 || (kparams->n_buf < 2 && (uint64_t) n_tiles_seq * kparams->n_s > 1)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    if (kparams->vtcm_size > octx->ctx->vtcm_size) {
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
+
+    octx->src0_spad.size_per_thread = kparams->vtcm_src0_size_per_thread;
+    octx->src1_spad.size_per_thread = kparams->vtcm_src1_size_per_thread;
+    octx->dst_spad.size_per_thread  = kparams->vtcm_dst_size_per_thread;
+
+    octx->src0_spad.size = kparams->vtcm_src0_size;
+    octx->src1_spad.size = kparams->vtcm_src1_size;
+    octx->dst_spad.size  = kparams->vtcm_dst_size;
+
+    octx->src0_spad.data = octx->ctx->vtcm_base;
+    octx->src1_spad.data = octx->src0_spad.data + octx->src0_spad.size;
+    octx->dst_spad.data  = octx->src1_spad.data + octx->src1_spad.size;
+    octx->src0_spad.src  = NULL;
+    octx->src1_spad.src  = NULL;
+    octx->dst_spad.src   = NULL;
+
+    struct htp_ssm_conv_chain_context ccctx = {
+        .octx    = octx,
+        .kparams = kparams,
+    };
+    atomic_init(&ccctx.state_barrier, octx->n_threads);
+
+    FARF(HIGH, "ssm-conv-chain-f32: state (%ux%u) qkv (%ux%u) w (%ux%u) -> (%ux%u) : %s n_s %u tile %u\n",
+         st_in->ne[0], st_in->ne[1], qkv->ne[0], qkv->ne[1], wgt->ne[0], wgt->ne[1],
+         dst->ne[0], dst->ne[1], kparams->n_t == 1 ? "decode" : "prefill", kparams->n_s, kparams->d_inner_tile);
+
+    work_queue_run(octx->ctx->work_queue, ssm_conv_chain_thread_f32, &ccctx, octx->n_threads);
+
+    return HTP_STATUS_OK;
 }

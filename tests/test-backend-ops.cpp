@@ -4436,6 +4436,62 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// recurrent conv chain of the gated delta net layers: CONCAT + CPY of the new conv state + SSM_CONV + SILU
+struct test_ssm_conv_chain : public test_case {
+    const ggml_type type;
+    const int64_t d_conv;
+    const int64_t d_inner;
+    const int64_t n_t;
+    const int64_t n_s;
+
+    ggml_tensor * cpy_node  = nullptr;
+    ggml_tensor * silu_node = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_CHAIN";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node, silu_node }; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, d_conv, d_inner, n_t, n_s);
+    }
+
+    test_ssm_conv_chain(ggml_type type = GGML_TYPE_F32, int64_t d_conv = 4, int64_t d_inner = 256, int64_t n_t = 4,
+                        int64_t n_s = 1)
+        : type(type), d_conv(d_conv), d_inner(d_inner), n_t(n_t), n_s(n_s) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_state = d_conv - 1;
+
+        ggml_tensor * conv_states = ggml_new_tensor_3d(ctx, type, n_state, d_inner, n_s);
+        ggml_tensor * qkv         = ggml_new_tensor_3d(ctx, type, d_inner, n_t, n_s);
+        ggml_tensor * conv1d      = ggml_new_tensor_2d(ctx, type, d_conv, d_inner);
+        ggml_tensor * cache       = ggml_new_tensor_2d(ctx, type, n_state * d_inner, n_s);
+        ggml_set_name(conv_states, "conv_states");
+        ggml_set_name(qkv,         "qkv");
+        ggml_set_name(conv1d,      "conv1d");
+        ggml_set_name(cache,       "cache");
+
+        ggml_tensor * conv_input = ggml_concat(ctx, conv_states, ggml_transpose(ctx, qkv), 0);
+
+        ggml_tensor * state_last = ggml_view_3d(ctx, conv_input, n_state, d_inner, n_s,
+                conv_input->nb[1], conv_input->nb[2], ggml_row_size(conv_input->type, n_t));
+        ggml_tensor * state_dst  = ggml_view_2d(ctx, cache, n_state * d_inner, n_s, cache->nb[1], 0);
+        cpy_node = ggml_cpy(ctx, state_last, state_dst);
+
+        silu_node = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, conv1d));
+
+        // sink that reads both outputs
+        const int64_t n = std::min(n_state * d_inner, d_inner * n_t);
+        ggml_tensor * out = ggml_add(ctx, ggml_view_1d(ctx, cpy_node, n, 0), ggml_view_1d(ctx, silu_node, n, 0));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -9840,6 +9896,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_ssm_conv_bias_silu(
                     GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}, fuse_bias));
             }
+        }
+    }
+
+    for (int64_t n_s : {1, 2}) {
+        test_cases.emplace_back(new test_ssm_conv_chain(GGML_TYPE_F32, 4, 224, 4, n_s));
+        for (int64_t n_t : {1, 128}) {
+            test_cases.emplace_back(new test_ssm_conv_chain(GGML_TYPE_F32, 4, 6144, n_t, n_s)); // Qwen3.5 0.8B
         }
     }
 

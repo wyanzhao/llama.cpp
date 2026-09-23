@@ -121,6 +121,7 @@ enum ggml_hexagon_fusion_flags {
     GGML_HEXAGON_FUSE_MUL_MAT_NX    = (1 << 4), // 16
     GGML_HEXAGON_FUSE_MUL_MAT_ID_NX = (1 << 5), // 32
     GGML_HEXAGON_FUSE_GDN_CPY       = (1 << 6), // 64
+    GGML_HEXAGON_FUSE_SSM_CONV_CHAIN = (1 << 7), // 128
 };
 
 static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
@@ -5192,6 +5193,116 @@ static void ggml_hexagon_precompute_ssm_conv_params(
     kparams->div_n_threads = init_fastdiv_values(n_threads);
 }
 
+// VTCM per thread:
+//   src0: conv state stage {n_s, n_state, d_inner_per_thread} | n_buf x [ xt {ncs, tile} | state_out {tile, n_state} ]
+//   src1: weights raw | weights transposed
+//   dst : n_buf x {n_t, tile}
+// Returns false if no tiling fits in VTCM.
+static bool ggml_hexagon_precompute_ssm_conv_chain_params(
+    const struct ggml_hexagon_session * sess,
+    uint32_t d_conv,
+    uint32_t d_inner,
+    uint32_t n_t,
+    uint32_t n_s,
+    uint32_t st_in_seq_stride,
+    uint32_t qkv_seq_stride,
+    uint32_t dst_seq_stride,
+    uint32_t st_out_seq_stride,
+    struct htp_ssm_conv_chain_kernel_params * kparams
+) {
+    memset(kparams, 0, sizeof(*kparams));
+
+    const uint32_t n_state = d_conv - 1;
+    const uint32_t ncs     = n_t + n_state;
+
+    const uint32_t n_threads = (std::min)((uint32_t) sess->n_threads, (d_inner + 31) / 32);
+    if (n_threads == 0) {
+        return false;
+    }
+
+    const uint32_t d_inner_per_thread = hex_round_up((d_inner + n_threads - 1) / n_threads, 32);
+
+    const uint32_t w_raw_bytes          = hex_round_up(d_inner_per_thread * d_conv * sizeof(float), 128) + 128;
+    const uint32_t w_T_bytes            = hex_round_up(d_conv * d_inner_per_thread * sizeof(float), 128);
+    const uint32_t vtcm_src1_per_thread = w_raw_bytes + w_T_bytes;
+    const uint32_t state_stage_bytes    = hex_round_up(n_s * n_state * d_inner_per_thread * sizeof(float), 128) + 128;
+
+    const size_t vtcm_budget = sess->vtcm_size / n_threads;
+    if (vtcm_budget <= (size_t) vtcm_src1_per_thread + state_stage_bytes) {
+        return false;
+    }
+    const size_t avail = vtcm_budget - vtcm_src1_per_thread - state_stage_bytes;
+
+    // decode with one sequence is a single tile; everything else is split into at least 4 tiles and double buffered
+    constexpr uint32_t N_TILES_PIPELINE = 4;
+    const uint32_t n_buf       = (n_t == 1 && n_s == 1) ? 1 : 2;
+    const uint32_t per_channel = n_buf * (ncs + n_t + n_state) * sizeof(float);
+
+    uint32_t d_inner_tile = 0;
+    if (avail > 1024 * n_buf) {
+        d_inner_tile = (uint32_t) ((avail - 1024 * n_buf) / per_channel);
+    }
+    d_inner_tile = (std::min)((d_inner_tile / 32) * 32, d_inner_per_thread);
+    if (n_buf > 1 && d_inner_tile > 0) {
+        const uint32_t n_tiles = (std::max)((d_inner_per_thread + d_inner_tile - 1) / d_inner_tile, N_TILES_PIPELINE);
+        const uint32_t even    = hex_round_up((d_inner_per_thread + n_tiles - 1) / n_tiles, 32);
+        d_inner_tile = (std::min)(d_inner_tile, even);
+    }
+
+    for (; d_inner_tile >= 32; d_inner_tile -= 32) {
+        // a single buffer only works when the thread's channels fit in one tile
+        if (n_buf == 1 && d_inner_tile < d_inner_per_thread) {
+            break;
+        }
+
+        const uint32_t xt_bytes        = hex_round_up(ncs * d_inner_tile * sizeof(float), 128);
+        const uint32_t state_out_bytes = hex_round_up(d_inner_tile * n_state * sizeof(float), 128);
+        const uint32_t buf_stride      = xt_bytes + state_out_bytes;
+        const uint32_t dst_tile_bytes  = hex_round_up(n_t * d_inner_tile * sizeof(float), 128);
+
+        const uint32_t vtcm_src0_per_thread = state_stage_bytes + n_buf * buf_stride;
+        const uint32_t vtcm_dst_per_thread  = n_buf * dst_tile_bytes;
+
+        if ((size_t) vtcm_src0_per_thread + vtcm_src1_per_thread + vtcm_dst_per_thread > vtcm_budget) {
+            continue;
+        }
+
+        kparams->n_threads          = n_threads;
+        kparams->d_conv             = d_conv;
+        kparams->n_state            = n_state;
+        kparams->d_inner            = d_inner;
+        kparams->n_t                = n_t;
+        kparams->ncs                = ncs;
+        kparams->n_s                = n_s;
+        kparams->d_inner_per_thread = d_inner_per_thread;
+        kparams->d_inner_tile       = d_inner_tile;
+
+        kparams->st_in_seq_stride  = st_in_seq_stride;
+        kparams->qkv_seq_stride    = qkv_seq_stride;
+        kparams->dst_seq_stride    = dst_seq_stride;
+        kparams->st_out_seq_stride = st_out_seq_stride;
+
+        kparams->n_buf                  = n_buf;
+        kparams->vtcm_xt_bytes          = xt_bytes;
+        kparams->vtcm_state_stage_bytes = state_stage_bytes;
+        kparams->vtcm_buf_stride        = buf_stride;
+        kparams->vtcm_dst_tile_bytes    = dst_tile_bytes;
+
+        kparams->vtcm_src0_size_per_thread = vtcm_src0_per_thread;
+        kparams->vtcm_src1_size_per_thread = vtcm_src1_per_thread;
+        kparams->vtcm_dst_size_per_thread  = vtcm_dst_per_thread;
+
+        kparams->vtcm_src0_size = vtcm_src0_per_thread * n_threads;
+        kparams->vtcm_src1_size = vtcm_src1_per_thread * n_threads;
+        kparams->vtcm_dst_size  = vtcm_dst_per_thread  * n_threads;
+        kparams->vtcm_size      = kparams->vtcm_src0_size + kparams->vtcm_src1_size + kparams->vtcm_dst_size;
+
+        return kparams->vtcm_size <= sess->vtcm_size;
+    }
+
+    return false;
+}
+
 static void ggml_hexagon_precompute_gated_delta_net_params(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,
@@ -6359,6 +6470,9 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
     return true;
 }
 
+static bool ggml_hexagon_try_fuse_ssm_conv_chain(const ggml_hexagon_session * sess, const ggml_cgraph * graph, int i,
+                                                 const std::vector<bool> & consumed, int idx[3], htp_opnode & out);
+
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
 
@@ -6395,10 +6509,24 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
         computed_nodes.reserve(graph->n_nodes);
 
+        // nodes absorbed by a fusion that looks ahead
+        std::vector<bool> consumed(graph->n_nodes, false);
+
         for (int i = 0; i < graph->n_nodes; ++i) {
             ggml_tensor * n = graph->nodes[i];
-            if (!op_is_compute(n)) {
+            if (!op_is_compute(n) || consumed[i]) {
                 continue;
+            }
+
+            if (n->op == GGML_OP_CONCAT && ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_SSM_CONV_CHAIN)) {
+                htp_opnode chain;
+                int idx[3];
+                if (ggml_hexagon_try_fuse_ssm_conv_chain(sess, graph, i, consumed, idx, chain)) {
+                    HEX_VERBOSE("ggml-hex: %s fused SSM_CONV_CHAIN at node %d\n", sess->c_name(), i);
+                    consumed[idx[0]] = consumed[idx[1]] = consumed[idx[2]] = true;
+                    computed_nodes.push_back(std::move(chain));
+                    continue;
+                }
             }
 
             htp_opnode node(HTP_OP_INVALID, n);
@@ -6591,6 +6719,191 @@ static bool ggml_hexagon_mem_ranges_check_node(const ggml_hexagon_mem_ranges & m
         }
     }
     return mrs.check(ggml_hexagon_mem_range_from_tensor(node.dst(), HEXAGON_MEM_RANGE_TYPE_DST));
+}
+
+// HTP_OP_SSM_CONV_CHAIN: CONCAT(conv_states, qkv^T), CPY of the new conv state, SSM_CONV and SILU in one op.
+// The ops are not adjacent: the fused op runs at the CONCAT, so the ops in between must not touch what it writes.
+
+static int32_t ggml_hexagon_tensor_use_count(const ggml_cgraph * graph, const ggml_tensor * t) {
+    const size_t hash_pos = ggml_hash_find(&graph->visited_hash_set, t);
+    if (hash_pos == GGML_HASHSET_FULL || !ggml_bitset_get(graph->visited_hash_set.used, hash_pos)) {
+        return -1;
+    }
+    return graph->use_counts[hash_pos];
+}
+
+static inline bool ggml_hexagon_ssm_conv_chain_tensor_ok(const ggml_tensor * t) {
+    return t && t->buffer && t->extra && t->data && t->type == GGML_TYPE_F32;
+}
+
+// Returns true and the graph indices of the CPY, SSM_CONV and SILU if nodes[i] starts a fusable chain.
+static bool ggml_hexagon_try_fuse_ssm_conv_chain(const ggml_hexagon_session * sess, const ggml_cgraph * graph, int i,
+                                                 const std::vector<bool> & consumed, int idx[3], htp_opnode & out) {
+    if (sess->mdev.count > 1) {
+        return false;
+    }
+
+    ggml_tensor * concat = graph->nodes[i];
+    if (concat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(concat, 0) != 0) {
+        return false;
+    }
+
+    // look a few compute nodes ahead for the CPY, the SSM_CONV and the SILU
+    constexpr int N_LOOKAHEAD = 8;
+
+    idx[0] = idx[1] = idx[2] = -1;
+    for (int j = i + 1, k = 0; j < graph->n_nodes && k < N_LOOKAHEAD && idx[2] < 0; j++) {
+        ggml_tensor * n = graph->nodes[j];
+        if (!op_is_compute(n)) {
+            continue;
+        }
+        k++;
+        if (consumed[j]) {
+            return false;
+        }
+        if (idx[0] < 0 && n->op == GGML_OP_CPY && n->src[0] && n->src[0]->view_src == concat) {
+            idx[0] = j;
+        } else if (idx[1] < 0 && n->op == GGML_OP_SSM_CONV && n->src[0] == concat) {
+            idx[1] = j;
+        } else if (idx[1] >= 0 && n->op == GGML_OP_UNARY && ggml_get_unary_op(n) == GGML_UNARY_OP_SILU &&
+                   n->src[0] == graph->nodes[idx[1]]) {
+            idx[2] = j;
+        }
+    }
+    if (idx[0] < 0 || idx[1] < 0 || idx[2] < 0) {
+        return false;
+    }
+
+    ggml_tensor * cpy  = graph->nodes[idx[0]];
+    ggml_tensor * conv = graph->nodes[idx[1]];
+    ggml_tensor * silu = graph->nodes[idx[2]];
+
+    ggml_tensor * conv_states = concat->src[0];
+    ggml_tensor * qkv_t       = concat->src[1];
+    ggml_tensor * conv1d      = conv->src[1];
+
+    for (const ggml_tensor * t : { concat, conv_states, qkv_t, cpy, conv, conv1d, silu }) {
+        if (!ggml_hexagon_ssm_conv_chain_tensor_ok(t)) {
+            return false;
+        }
+    }
+
+    const int64_t n_state = conv_states->ne[0];
+    const int64_t d_inner = conv_states->ne[1];
+    const int64_t n_s     = conv_states->ne[2];
+    const int64_t n_t     = qkv_t->ne[0];
+    const int64_t ncs     = n_state + n_t;
+    const int64_t d_conv  = conv1d->ne[0];
+
+    if (n_state < 1 || n_state > 31 || d_inner < 32 || n_t < 1 || n_s < 1 || d_conv != n_state + 1) {
+        return false;
+    }
+    if (conv_states->ne[3] != 1 || qkv_t->ne[1] != d_inner || qkv_t->ne[2] != n_s || qkv_t->ne[3] != 1 ||
+        concat->ne[0] != ncs || concat->ne[1] != d_inner || concat->ne[2] != n_s || concat->ne[3] != 1) {
+        return false;
+    }
+
+    // conv_states: contiguous channel-major rows; qkv_t: transposed view (channels contiguous)
+    const size_t st_in_seq_stride = (size_t) n_state * d_inner * sizeof(float);
+    if (conv_states->nb[0] != sizeof(float) || conv_states->nb[1] != (size_t) n_state * sizeof(float) ||
+        (n_s > 1 && conv_states->nb[2] != st_in_seq_stride)) {
+        return false;
+    }
+    if (qkv_t->nb[1] != sizeof(float) || qkv_t->nb[0] < (size_t) d_inner * sizeof(float)) {
+        return false;
+    }
+    if (concat->nb[1] != (size_t) ncs * sizeof(float) || concat->nb[2] != (size_t) ncs * d_inner * sizeof(float)) {
+        return false;
+    }
+
+    // conv_input feeds only the state view and the SSM_CONV (this also declines the n_rs_seq > 0 rollback form)
+    if ((concat->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_hexagon_tensor_use_count(graph, concat) != 2) {
+        return false;
+    }
+
+    const ggml_tensor * state_view = cpy->src[0];
+    if (state_view->op != GGML_OP_VIEW || state_view->view_offs != (size_t) n_t * sizeof(float) ||
+        state_view->ne[0] != n_state || state_view->ne[1] != d_inner || state_view->ne[2] != n_s ||
+        state_view->ne[3] != 1 || state_view->nb[0] != sizeof(float) || state_view->nb[1] != concat->nb[1] ||
+        (n_s > 1 && state_view->nb[2] != concat->nb[2]) ||
+        ggml_hexagon_tensor_use_count(graph, state_view) != 1) {
+        return false;
+    }
+    if (cpy->ne[0] != n_state * d_inner || cpy->ne[1] != n_s || cpy->ne[2] != 1 || cpy->ne[3] != 1 ||
+        cpy->nb[0] != sizeof(float) || (n_s > 1 && cpy->nb[1] != st_in_seq_stride)) {
+        return false;
+    }
+
+    if (conv1d->ne[1] != d_inner || conv1d->ne[2] != 1 || conv1d->ne[3] != 1 ||
+        conv1d->nb[0] != sizeof(float) || conv1d->nb[1] != (size_t) d_conv * sizeof(float)) {
+        return false;
+    }
+    if (conv->ne[0] != d_inner || conv->ne[1] != n_t || conv->ne[2] != n_s || conv->ne[3] != 1 ||
+        (conv->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_hexagon_tensor_use_count(graph, conv) != 1) {
+        return false;
+    }
+    if (silu->ne[0] != d_inner || silu->ne[1] != n_t || silu->ne[2] != n_s || silu->ne[3] != 1 ||
+        silu->nb[0] != sizeof(float) || silu->nb[1] < (size_t) d_inner * sizeof(float)) {
+        return false;
+    }
+
+    const size_t qkv_seq_stride    = n_s > 1 ? qkv_t->nb[2] : 0;
+    const size_t dst_seq_stride    = n_s > 1 ? silu->nb[2]  : 0;
+    const size_t st_out_seq_stride = n_s > 1 ? cpy->nb[1]   : 0;
+    if (qkv_seq_stride > UINT32_MAX || dst_seq_stride > UINT32_MAX || st_out_seq_stride > UINT32_MAX ||
+        st_in_seq_stride > UINT32_MAX) {
+        return false;
+    }
+
+    // An output on top of qkv is safe only as a backward whole-row shift (row t on qkv row t - k, already read).
+    // An overlap with conv_states is safe: the kernel stages all of it before any output DMA.
+    for (const ggml_tensor * t : { (const ggml_tensor *) silu, (const ggml_tensor *) cpy }) {
+        ggml_hexagon_mem_ranges mr;
+        mr.add(ggml_hexagon_mem_range_from_tensor(qkv_t, HEXAGON_MEM_RANGE_TYPE_SRC));
+        if (mr.check(ggml_hexagon_mem_range_from_tensor(t, HEXAGON_MEM_RANGE_TYPE_DST))) {
+            continue;
+        }
+        const size_t    row   = silu->nb[1];
+        const ptrdiff_t delta = (const char *) t->data - (const char *) qkv_t->data;
+        if (t != silu || row != qkv_t->nb[0] || (n_s > 1 && silu->nb[2] != qkv_t->nb[2]) ||
+            delta > 0 || (size_t) (-delta) % row != 0) {
+            HEX_VERBOSE("ggml-hex: %s skip SSM_CONV_CHAIN: %s overlaps qkv\n", sess->c_name(), t->name);
+            return false;
+        }
+    }
+
+    struct htp_ssm_conv_chain_kernel_params kparams;
+    if (!ggml_hexagon_precompute_ssm_conv_chain_params(sess, (uint32_t) d_conv, (uint32_t) d_inner, (uint32_t) n_t, (uint32_t) n_s,
+            (uint32_t) st_in_seq_stride, (uint32_t) qkv_seq_stride, (uint32_t) dst_seq_stride, (uint32_t) st_out_seq_stride, &kparams)) {
+        HEX_VERBOSE("ggml-hex: %s skip SSM_CONV_CHAIN: no VTCM layout (d_inner %d n_t %d n_s %d)\n",
+                    sess->c_name(), (int) d_inner, (int) n_t, (int) n_s);
+        return false;
+    }
+
+    // The CPY, SSM_CONV and SILU run earlier than in the graph: the ops in between must not write conv1d or
+    // read or write either output. conv_input and the raw conv output are not touched by the fused op.
+    ggml_hexagon_mem_ranges mrs;
+    mrs.add(ggml_hexagon_mem_range_from_tensor(conv1d, HEXAGON_MEM_RANGE_TYPE_SRC));
+    mrs.add(ggml_hexagon_mem_range_from_tensor(silu,   HEXAGON_MEM_RANGE_TYPE_DST));
+    mrs.add(ggml_hexagon_mem_range_from_tensor(cpy,    HEXAGON_MEM_RANGE_TYPE_DST));
+    for (int j = i + 1; j < idx[2]; j++) {
+        if (j == idx[0] || j == idx[1] || !op_is_compute(graph->nodes[j])) {
+            continue;
+        }
+        if (!ggml_hexagon_mem_ranges_check_node(mrs, htp_opnode(HTP_OP_INVALID, graph->nodes[j]))) {
+            HEX_VERBOSE("ggml-hex: %s skip SSM_CONV_CHAIN: %s aliases the chain\n", sess->c_name(), graph->nodes[j]->name);
+            return false;
+        }
+    }
+
+    out = htp_opnode(HTP_OP_SSM_CONV_CHAIN, concat);
+    out.name    = "SSM_CONV_CHAIN";
+    out.fused   = { cpy, conv, silu };
+    out.inputs  = { conv_states, qkv_t, conv1d };
+    out.outputs = { silu, cpy };
+    memcpy(out.kernel_params, &kparams, sizeof(kparams));
+
+    return true;
 }
 
 static std::vector<int> ggml_hexagon_graph_optimize_reorder(const std::vector<htp_opnode> & nodes) {

@@ -901,6 +901,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_SSM_CONV:
             return op_ssm_conv(octx);
 
+        case HTP_OP_SSM_CONV_CHAIN:
+            return op_ssm_conv_chain(octx);
+
         case HTP_OP_CUMSUM:
             return op_cumsum(octx);
 
