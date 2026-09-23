@@ -35,6 +35,7 @@
 #include "hex-profile.h"
 #include "allreduce-ops.h"
 #include "htp-fence.h"
+#include "gated-delta-net-ops.h"
 
 #define HMX_QUEUE_CAPACITY     128
 #define HMX_QUEUE_STACK_SIZE   16384
@@ -1094,6 +1095,24 @@ static void mdev_group_init(struct htp_context * ctx, const struct htp_opbatch_r
     ctx->mdev.fence_seq = (uint32_t)((req->seq & 0xfffff) << 12);
 }
 
+// Ops that read and write DDR only by DMA (single device). Outputs are recorded whole, so a part left unwritten
+// (the GATED_DELTA_NET dst state area when dsts[1] takes the state) must have no reader.
+static bool htp_op_is_dma_only(const struct htp_ops_context * octx) {
+    if (octx->ctx->mdev.count > 1) {
+        return false;
+    }
+    switch (octx->op) {
+        case HTP_OP_SSM_CONV_CHAIN:
+            return true;
+        case HTP_OP_GATED_DELTA_NET: {
+            const struct htp_gdn_kernel_params * kp = (const struct htp_gdn_kernel_params *) octx->kernel_params;
+            return kp->S_v != 0 && kp->kernel_type == HTP_GDN_KERNEL_HMX_CHUNKED;
+        }
+        default:
+            return false;
+    }
+}
+
 static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs, uint32_t n_bufs,
                        struct htp_tensor * tens, uint32_t idx, struct htp_op_desc * op) {
     memcpy(octx->op_params,     op->params, sizeof(octx->op_params));
@@ -1120,7 +1139,9 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
             src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
     }
 
-    htp_tensor_flush_all(octx->ctx, octx->src, HTP_OP_MAX_INPUTS);
+    const bool dma_only = htp_op_is_dma_only(octx);
+
+    htp_tensor_flush_all(octx->ctx, octx->src, HTP_OP_MAX_INPUTS, dma_only);
 
     // Prep output tensors
     for (uint32_t i = 0; i < HTP_OP_MAX_OUTPUTS; i++) {
@@ -1141,6 +1162,8 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
     htp_mdev_group_barrier(octx);
 
     int status = execute_op(octx);
+
+    htp_dma_clean_note_outputs(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS, dma_only && status == HTP_STATUS_OK);
 
     htp_ops_context_set_status(octx, status);
 
@@ -1199,6 +1222,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
     hex_l2fetch_block(ctx, ctx->footprint);
     memset(ctx->dirty_ranges, 0, sizeof(ctx->dirty_ranges));
+    htp_dma_clean_reset(ctx);
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
 
     htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);

@@ -20,6 +20,7 @@
 
 #define HTP_MAX_MMAPS        64
 #define HTP_MAX_DIRTY_RANGES 64
+#define HTP_MAX_DMA_CLEAN    32
 
 // Memory mapping
 struct htp_mmap {
@@ -109,6 +110,9 @@ struct htp_context {
 
     uint64_t               max_vmem;
     struct htp_dirty_range dirty_ranges[HTP_MAX_DIRTY_RANGES];
+    // output ranges of this batch written only by DMA and not written by cached stores since
+    struct htp_dirty_range dma_clean[HTP_MAX_DMA_CLEAN];
+    uint32_t               dma_clean_next;
 
     // Persistent DDR scratchpad for MUL_MAT_ID mappings
     void *                 ddr_spad_base;

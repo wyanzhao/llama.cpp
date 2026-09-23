@@ -328,7 +328,59 @@ void htp_flush_dirty_ranges(struct htp_context * ctx) {
     memset(ctx->dirty_ranges, 0, sizeof(ctx->dirty_ranges));
 }
 
-void htp_tensor_flush_all(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n) {
+void htp_dma_clean_reset(struct htp_context * ctx) {
+    memset(ctx->dma_clean, 0, sizeof(ctx->dma_clean));
+    ctx->dma_clean_next = 0;
+}
+
+// A DMA-only writer records its outputs; any other writer drops the entries its outputs touch.
+// Losing an entry (drop or ring overwrite) only loses the optimization.
+void htp_dma_clean_note_outputs(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n,
+                                bool dma_only) {
+    for (uint32_t i = 0; i < n; i++) {
+        const struct htp_tensor * t = tensors[i];
+        if (!t || !t->size) {
+            continue;
+        }
+
+        uint32_t t_start = t->data;
+        uint32_t t_end   = t_start + t->size;
+
+        if (dma_only) {
+            struct htp_dirty_range * r = &ctx->dma_clean[ctx->dma_clean_next];
+            r->start = t_start;
+            r->end   = t_end;
+            ctx->dma_clean_next = (ctx->dma_clean_next + 1) % HTP_MAX_DMA_CLEAN;
+            continue;
+        }
+
+        for (uint32_t j = 0; j < HTP_MAX_DMA_CLEAN; j++) {
+            struct htp_dirty_range * r = &ctx->dma_clean[j];
+            if (r->start && r->start < t_end && t_start < r->end) {
+                r->start = 0;
+                r->end   = 0;
+            }
+        }
+    }
+}
+
+static inline bool is_tensor_dma_clean(const struct htp_context * ctx, const struct htp_tensor * t) {
+    uint32_t t_start = t->data;
+    uint32_t t_end   = t_start + t->size;
+
+    for (uint32_t i = 0; i < HTP_MAX_DMA_CLEAN; i++) {
+        const struct htp_dirty_range * r = &ctx->dma_clean[i];
+        if (r->start && r->start <= t_start && t_end <= r->end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// skip_dma_clean: the op reads every input by DMA, so an input written only by DMA needs no flush
+// (no dirty lines, and stale clean lines are not seen by DMA). It stays dirty for cached readers.
+void htp_tensor_flush_all(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n,
+                          bool skip_dma_clean) {
     const struct htp_tensor * dirty_tensors[HTP_OP_MAX_INPUTS];
     struct htp_dirty_range ranges[HTP_OP_MAX_INPUTS];
     uint32_t n_dirty = 0;
@@ -336,7 +388,7 @@ void htp_tensor_flush_all(struct htp_context * ctx, const struct htp_tensor * co
 
     for (uint32_t i = 0; i < n; i++) {
         const struct htp_tensor * t = tensors[i];
-        if (is_tensor_dirty(ctx, t)) {
+        if (is_tensor_dirty(ctx, t) && !(skip_dma_clean && is_tensor_dma_clean(ctx, t))) {
             dirty_tensors[n_dirty++] = t;
             ranges[n_dirty - 1].start = t->data;
             ranges[n_dirty - 1].end   = t->data + t->size;
