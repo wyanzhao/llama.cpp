@@ -94,7 +94,63 @@ static void merge_dirty_ranges(struct htp_context * ctx) {
     }
 }
 
+// Active ranges are always disjoint and do not touch, so one pass merges a new range with every range it touches.
+// Needs a free slot per new range, else returns false with the table unchanged.
+static bool dirty_all_fast(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n) {
+    uint32_t n_new  = 0;
+    uint32_t n_free = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const struct htp_tensor * t = tensors[i];
+        n_new += t && !(t->flags & (HTP_TENSOR_WEIGHT | HTP_TENSOR_FENCE));
+    }
+    for (uint32_t j = 0; j < HTP_MAX_DIRTY_RANGES; j++) {
+        n_free += !ctx->dirty_ranges[j].start;
+    }
+    if (n_free < n_new) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < n; i++) {
+        const struct htp_tensor * t = tensors[i];
+        if (!t || (t->flags & (HTP_TENSOR_WEIGHT | HTP_TENSOR_FENCE))) {
+            continue;
+        }
+
+        uint32_t t_start = t->data;
+        uint32_t t_end   = t_start + t->size;
+        int      keep    = -1;
+        int      empty   = -1;
+        for (uint32_t j = 0; j < HTP_MAX_DIRTY_RANGES; j++) {
+            struct htp_dirty_range * r = &ctx->dirty_ranges[j];
+            if (!r->start) {
+                if (empty < 0) empty = (int) j;
+                continue;
+            }
+            if (r->start <= t_end && t_start <= r->end) {
+                t_start = MIN(t_start, r->start);
+                t_end   = MAX(t_end, r->end);
+                if (keep < 0) {
+                    keep = (int) j;
+                } else {
+                    r->start = 0;
+                    r->end   = 0;
+                }
+            }
+        }
+        if (keep < 0) {
+            keep = empty;
+        }
+        ctx->dirty_ranges[keep].start = t_start;
+        ctx->dirty_ranges[keep].end   = t_end;
+    }
+    return true;
+}
+
 void htp_tensor_dirty_all(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n) {
+    if (dirty_all_fast(ctx, tensors, n)) {
+        return;
+    }
+
     const struct htp_tensor * pending[HTP_OP_MAX_OUTPUTS];
     uint32_t n_pending = 0;
 
