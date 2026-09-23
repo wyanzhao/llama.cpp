@@ -5207,6 +5207,7 @@ static bool ggml_hexagon_precompute_ssm_conv_chain_params(
     uint32_t dst_seq_stride,
     uint32_t st_out_seq_stride,
     uint32_t qk_head_dim,
+    uint32_t n_qk,
     uint32_t n_tb,
     struct htp_ssm_conv_chain_kernel_params * kparams
 ) {
@@ -5228,7 +5229,58 @@ static bool ggml_hexagon_precompute_ssm_conv_chain_params(
         return false;
     }
 
-    const uint32_t d_inner_per_thread = hex_round_up((d_inner + n_threads - 1) / n_threads, align);
+    uint32_t d_inner_per_thread = hex_round_up((d_inner + n_threads - 1) / n_threads, align);
+
+    // With the epilogue a q/k head costs about 14/9 of a v head at prefill (decode keeps the even split), so split the
+    // heads into contiguous ranges of the smallest maximum cost instead of evenly. Starts go in 32-channel units.
+    uint8_t  ch_start[HTP_SSM_CONV_CHAIN_MAX_BALANCED_THREADS - 1] = { 0 };
+    bool     balanced = false;
+    if (qk_head_dim && n_qk > 0 && n_qk < d_inner && n_qk % qk_head_dim == 0 && n_threads > 1 && n_t > 1 &&
+        n_threads <= HTP_SSM_CONV_CHAIN_MAX_BALANCED_THREADS && d_inner / 32 <= 255) {
+        const uint32_t n_units = d_inner / qk_head_dim;
+        const uint32_t n_qk_u  = n_qk / qk_head_dim;
+        auto cost = [&](uint32_t u) { return u < n_qk_u ? 14u : 9u; };
+        // greedy fill under a cost cap, returns the number of ranges and their starts in head units
+        auto fill = [&](uint32_t cap, uint32_t * starts) {
+            uint32_t parts = 1, acc = 0;
+            for (uint32_t u = 0; u < n_units; u++) {
+                if (acc + cost(u) > cap) {
+                    if (starts && parts < n_threads) {
+                        starts[parts - 1] = u;
+                    }
+                    parts++;
+                    acc = 0;
+                }
+                acc += cost(u);
+            }
+            return parts;
+        };
+        uint32_t lo = 14, hi = 14 * n_units;
+        while (lo < hi) {
+            const uint32_t mid = (lo + hi) / 2;
+            if (fill(mid, nullptr) <= n_threads) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        uint32_t starts[HTP_SSM_CONV_CHAIN_MAX_BALANCED_THREADS] = { 0 };
+        const uint32_t parts = fill(lo, starts);
+        for (uint32_t t = parts - 1; t + 1 < n_threads; t++) {
+            starts[t] = n_units;  // trailing threads get an empty range
+        }
+        uint32_t widest = 0, prev = 0;
+        for (uint32_t t = 0; t < n_threads; t++) {
+            const uint32_t end = t + 1 < n_threads ? starts[t] : n_units;
+            widest = (std::max)(widest, end - prev);
+            prev   = end;
+            if (t + 1 < n_threads) {
+                ch_start[t] = (uint8_t) (starts[t] * qk_head_dim / 32);
+            }
+        }
+        balanced           = true;
+        d_inner_per_thread = widest * qk_head_dim;
+    }
 
     const uint32_t w_raw_bytes          = hex_round_up(d_inner_per_thread * d_conv * sizeof(float), 128) + 128;
     const uint32_t w_T_bytes            = hex_round_up(d_conv * d_inner_per_thread * sizeof(float), 128);
@@ -5301,10 +5353,10 @@ static bool ggml_hexagon_precompute_ssm_conv_chain_params(
         kparams->vtcm_src1_size_per_thread = vtcm_src1_per_thread;
         kparams->vtcm_dst_size_per_thread  = vtcm_dst_per_thread;
 
-        kparams->vtcm_src0_size = vtcm_src0_per_thread * n_threads;
-        kparams->vtcm_src1_size = vtcm_src1_per_thread * n_threads;
-        kparams->vtcm_dst_size  = vtcm_dst_per_thread  * n_threads;
-        kparams->vtcm_size      = kparams->vtcm_src0_size + kparams->vtcm_src1_size + kparams->vtcm_dst_size;
+        kparams->vtcm_size = (vtcm_src0_per_thread + vtcm_src1_per_thread + vtcm_dst_per_thread) * n_threads;
+
+        kparams->balanced = balanced;
+        memcpy(kparams->ch_start, ch_start, sizeof(kparams->ch_start));
 
         return kparams->vtcm_size <= sess->vtcm_size;
     }
@@ -7150,7 +7202,7 @@ static bool ggml_hexagon_try_fuse_ssm_conv_chain(const ggml_hexagon_session * se
         kp_ok = ggml_hexagon_precompute_ssm_conv_chain_params(sess, (uint32_t) d_conv, (uint32_t) d_inner,
                     (uint32_t) n_t, (uint32_t) n_s, (uint32_t) st_in_seq_stride, (uint32_t) qkv_seq_stride,
                     (uint32_t) dst_seq_stride, (uint32_t) st_out_seq_stride,
-                    (uint32_t) qk.head_dim, 0, &kparams);
+                    (uint32_t) qk.head_dim, (uint32_t) qk.n_qk, 0, &kparams);
         for (uint32_t n_blk = 2; !kp_ok && n_blk <= 64; n_blk++) {
             const uint32_t n_tb = ((uint32_t) n_t + n_blk - 1) / n_blk;
             if (n_tb < 16) {
@@ -7159,7 +7211,7 @@ static bool ggml_hexagon_try_fuse_ssm_conv_chain(const ggml_hexagon_session * se
             kp_ok = ggml_hexagon_precompute_ssm_conv_chain_params(sess, (uint32_t) d_conv, (uint32_t) d_inner,
                         (uint32_t) n_t, (uint32_t) n_s, (uint32_t) st_in_seq_stride, (uint32_t) qkv_seq_stride,
                         (uint32_t) dst_seq_stride, (uint32_t) st_out_seq_stride,
-                        (uint32_t) qk.head_dim, n_tb, &kparams);
+                        (uint32_t) qk.head_dim, (uint32_t) qk.n_qk, n_tb, &kparams);
         }
         if (kp_ok) {
             kparams.qk_eps   = qk.eps;
@@ -7174,8 +7226,9 @@ static bool ggml_hexagon_try_fuse_ssm_conv_chain(const ggml_hexagon_session * se
             }
         }
     }
-    if (!kp_ok && !ggml_hexagon_precompute_ssm_conv_chain_params(sess, (uint32_t) d_conv, (uint32_t) d_inner, (uint32_t) n_t, (uint32_t) n_s,
-            (uint32_t) st_in_seq_stride, (uint32_t) qkv_seq_stride, (uint32_t) dst_seq_stride, (uint32_t) st_out_seq_stride, 0, 0, &kparams)) {
+    if (!kp_ok && !ggml_hexagon_precompute_ssm_conv_chain_params(sess, (uint32_t) d_conv, (uint32_t) d_inner,
+            (uint32_t) n_t, (uint32_t) n_s, (uint32_t) st_in_seq_stride, (uint32_t) qkv_seq_stride,
+            (uint32_t) dst_seq_stride, (uint32_t) st_out_seq_stride, 0, 0, 0, &kparams)) {
         HEX_VERBOSE("ggml-hex: %s skip SSM_CONV_CHAIN: no VTCM layout (d_inner %d n_t %d n_s %d)\n",
                     sess->c_name(), (int) d_inner, (int) n_t, (int) n_s);
         return false;

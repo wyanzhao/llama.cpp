@@ -355,10 +355,10 @@ struct htp_opformat {
             snprintf(str, max_size, "%s vtcm %d", kparams->n_t == 1 ? "decode" : "prefill", (int) kparams->vtcm_size);
         } else if (node.opcode == HTP_OP_SSM_CONV_CHAIN) {
             const auto * kparams = (const struct htp_ssm_conv_chain_kernel_params *) node.kernel_params;
-            snprintf(str, max_size, "%s tile %u tb %u qk %u vtcm %u", kparams->n_t == 1 ? "decode" : "prefill",
+            snprintf(str, max_size, "%s tile %u tb %u qk %u bal %u vtcm %u", kparams->n_t == 1 ? "decode" : "prefill",
                      (unsigned int) kparams->d_inner_tile, (unsigned int) kparams->n_tb,
                      (unsigned int) kparams->qk_head_dim,
-                     (unsigned int) kparams->vtcm_size);
+                     (unsigned int) kparams->balanced, (unsigned int) kparams->vtcm_size);
         } else if (node.opcode == HTP_OP_SOFTMAX) {
             const auto * kparams = (const struct htp_softmax_kernel_params *) node.kernel_params;
             snprintf(str, max_size, "k%d nth %d vtcm %d", (int) kparams->kernel_id, (int) kparams->n_threads, (int) kparams->vtcm_size);

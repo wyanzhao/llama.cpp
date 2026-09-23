@@ -653,13 +653,16 @@ static void ssm_conv_chain_thread_f32(unsigned int nth, unsigned int ith, void *
     const uint32_t n_t          = kp->n_t;
     const uint32_t d_inner_tile = kp->d_inner_tile;
 
-    const uint32_t dr  = kp->d_inner_per_thread;
-    const uint32_t ir0 = dr * ith;
-    if (ir0 >= kp->d_inner) {
+    uint32_t ir0 = kp->d_inner_per_thread * ith;
+    uint32_t ir1 = MIN(ir0 + kp->d_inner_per_thread, kp->d_inner);
+    if (kp->balanced) {
+        ir0 = ith ? (uint32_t) kp->ch_start[ith - 1] * VLEN_FP32 : 0;
+        ir1 = ith + 1 < nth ? (uint32_t) kp->ch_start[ith] * VLEN_FP32 : kp->d_inner;
+    }
+    if (ir0 >= ir1) {
         atomic_fetch_sub(&ccctx->state_barrier, 1);
         return;
     }
-    const uint32_t ir1 = MIN(ir0 + dr, kp->d_inner);
 
     const uint32_t d_inner_per_thread = ir1 - ir0;
     const uint32_t d_inner_stride     = hex_round_up(d_inner_per_thread, VLEN_FP32);
@@ -847,6 +850,9 @@ int op_ssm_conv_chain(struct htp_ops_context * octx) {
     const struct htp_ssm_conv_chain_kernel_params * kparams =
         (const struct htp_ssm_conv_chain_kernel_params *) octx->kernel_params;
 
+    const uint32_t n_tb = kparams->n_tb ? kparams->n_tb : kparams->n_t;
+    const uint32_t hd   = kparams->qk_head_dim;
+
     if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
         return HTP_STATUS_INVAL_PARAMS;
     }
@@ -859,9 +865,9 @@ int op_ssm_conv_chain(struct htp_ops_context * octx) {
     octx->src1_spad.size_per_thread = kparams->vtcm_src1_size_per_thread;
     octx->dst_spad.size_per_thread  = kparams->vtcm_dst_size_per_thread;
 
-    octx->src0_spad.size = kparams->vtcm_src0_size;
-    octx->src1_spad.size = kparams->vtcm_src1_size;
-    octx->dst_spad.size  = kparams->vtcm_dst_size;
+    octx->src0_spad.size = kparams->vtcm_src0_size_per_thread * kparams->n_threads;
+    octx->src1_spad.size = kparams->vtcm_src1_size_per_thread * kparams->n_threads;
+    octx->dst_spad.size  = kparams->vtcm_dst_size_per_thread  * kparams->n_threads;
 
     octx->src0_spad.data = octx->ctx->vtcm_base;
     octx->src1_spad.data = octx->src0_spad.data + octx->src0_spad.size;
