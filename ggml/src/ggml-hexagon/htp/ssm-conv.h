@@ -31,16 +31,14 @@ struct htp_ssm_conv_kernel_params {
     struct fastdiv_values div_n_threads;
 };
 
-// Fused CONCAT + CPY + SSM_CONV + SILU (HTP_OP_SSM_CONV_CHAIN), per sequence:
-//   src[0] conv state {n_state, d_inner} (channel-major), src[1] qkv {n_t, d_inner} (transposed view), src[2] conv1d {d_conv, d_inner}
-//   dst[0] silu(conv) {d_inner, n_t}, dst[1] new conv state {n_state * d_inner}
+// HTP_OP_SSM_CONV_CHAIN: src conv state, qkv (transposed view), conv1d; dst silu(conv) {d_inner, n_t}, new conv state.
+// With qk_head_dim != 0, channels [0, n_q + n_k) get the per-head RMS_NORM + SCALE and go to dst[2] q and dst[3] k.
 struct htp_ssm_conv_chain_kernel_params {
     uint32_t n_threads;
     uint32_t d_conv;
     uint32_t n_state;             // d_conv - 1
     uint32_t d_inner;
     uint32_t n_t;
-    uint32_t ncs;                 // n_t + n_state, columns of the virtual concat
     uint32_t n_s;
     uint32_t d_inner_per_thread;  // multiple of 32
     uint32_t d_inner_tile;        // multiple of 32
@@ -65,6 +63,12 @@ struct htp_ssm_conv_chain_kernel_params {
     uint32_t vtcm_src1_size;
     uint32_t vtcm_dst_size;
     uint32_t vtcm_size;
+
+    uint32_t n_tb;         // token rows per block, 0 = all n_t tokens in one block
+    uint32_t qk_head_dim;  // 0 = no q/k l2-norm epilogue; else a multiple of 32 that divides the tile
+    float    qk_eps;       // RMS_NORM eps
+    float    qk_scale;     // SCALE scale and bias
+    float    qk_bias;
 };
 
 #if defined(__cplusplus)

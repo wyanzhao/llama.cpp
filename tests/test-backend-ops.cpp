@@ -4492,6 +4492,119 @@ struct test_ssm_conv_chain : public test_case {
     }
 };
 
+// conv chain followed by the per-head q/k l2-norm of the gated delta net layers (build_gdn_l2_norm)
+struct test_ssm_conv_chain_qk_norm : public test_case {
+    const ggml_type type;
+    const int64_t d_conv;
+    const int64_t head_dim;
+    const int64_t n_head;   // heads of each of q, k and v
+    const int64_t n_t;
+    const int64_t n_s;
+    const bool    gdn; // q, k and v feed a GATED_DELTA_NET, as in the model
+
+    ggml_tensor * cpy_node = nullptr;
+    ggml_tensor * q_node   = nullptr;
+    ggml_tensor * k_node   = nullptr;
+    ggml_tensor * v_node   = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_CHAIN_QK_NORM";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (gdn) {
+            return { cpy_node, v_node };
+        }
+        return { cpy_node, q_node, k_node, v_node };
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, d_conv, head_dim, n_head, n_t, n_s, gdn);
+    }
+
+    test_ssm_conv_chain_qk_norm(ggml_type type = GGML_TYPE_F32, int64_t d_conv = 4, int64_t head_dim = 64,
+                                int64_t n_head = 2, int64_t n_t = 4, int64_t n_s = 1, bool gdn = false)
+        : type(type), d_conv(d_conv), head_dim(head_dim), n_head(n_head), n_t(n_t), n_s(n_s), gdn(gdn) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_state = d_conv - 1;
+        const int64_t n_ch    = head_dim * n_head;
+        const int64_t d_inner = 3 * n_ch;
+
+        ggml_tensor * conv_states = ggml_new_tensor_3d(ctx, type, n_state, d_inner, n_s);
+        ggml_tensor * qkv         = ggml_new_tensor_3d(ctx, type, d_inner, n_t, n_s);
+        ggml_tensor * conv1d      = ggml_new_tensor_2d(ctx, type, d_conv, d_inner);
+        ggml_tensor * cache       = ggml_new_tensor_2d(ctx, type, n_state * d_inner, n_s);
+        ggml_set_name(conv_states, "conv_states");
+        ggml_set_name(qkv,         "qkv");
+        ggml_set_name(conv1d,      "conv1d");
+        ggml_set_name(cache,       "cache");
+
+        ggml_tensor * conv_input = ggml_concat(ctx, conv_states, ggml_transpose(ctx, qkv), 0);
+
+        ggml_tensor * state_last = ggml_view_3d(ctx, conv_input, n_state, d_inner, n_s,
+                conv_input->nb[1], conv_input->nb[2], ggml_row_size(conv_input->type, n_t));
+        ggml_tensor * state_dst  = ggml_view_2d(ctx, cache, n_state * d_inner, n_s, cache->nb[1], 0);
+        cpy_node = ggml_cpy(ctx, state_last, state_dst);
+
+        ggml_tensor * silu = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, conv1d));
+
+        ggml_tensor * view[2];
+        for (int i = 0; i < 2; i++) {
+            view[i] = ggml_view_4d(ctx, silu, head_dim, n_head, n_t, n_s, ggml_row_size(type, head_dim),
+                                   silu->nb[1], silu->nb[2],
+                                   ggml_row_size(type, i * n_ch));
+        }
+
+        const float eps = 1e-6f;
+        q_node = ggml_scale(ctx, ggml_rms_norm(ctx, view[0], eps / head_dim), 1.0f / sqrtf((float) head_dim));
+        k_node = ggml_scale(ctx, ggml_rms_norm(ctx, view[1], eps / head_dim), 1.0f / sqrtf((float) head_dim));
+
+        if (gdn) {
+            ggml_tensor * v     = ggml_view_4d(ctx, silu, head_dim, n_head, n_t, n_s, ggml_row_size(type, head_dim),
+                                               silu->nb[1], silu->nb[2], ggml_row_size(type, 2 * n_ch));
+            ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, 1, n_head, n_t, n_s);
+            ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, n_head, n_t, n_s);
+            ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_dim, head_dim, n_head, n_s);
+            ggml_set_name(g,     "g");
+            ggml_set_name(beta,  "beta");
+            ggml_set_name(state, "state");
+            v_node = ggml_gated_delta_net(ctx, q_node, k_node, v, g, beta, state, 1);
+
+            const int64_t n  = std::min(n_state * d_inner * n_s, ggml_nelements(v_node));
+            ggml_tensor * out = ggml_add(ctx, ggml_view_1d(ctx, cpy_node, n, 0), ggml_view_1d(ctx, v_node, n, 0));
+            ggml_set_name(out, "out");
+            return out;
+        }
+        ggml_tensor * v_rows = ggml_view_3d(ctx, silu, n_ch, n_t, n_s, silu->nb[1], silu->nb[2],
+                                            ggml_row_size(type, 2 * n_ch));
+        v_node = ggml_cont(ctx, v_rows);
+
+        // sink: the new state first so that the CPY comes before the SSM_CONV, then q, k and v
+        const int64_t n  = std::min(n_state * d_inner * n_s, n_ch * n_t * n_s);
+        ggml_tensor * qk = ggml_add(ctx, q_node, k_node);
+        ggml_tensor * qkv_sum = ggml_add(ctx, ggml_reshape_3d(ctx, qk, n_ch, n_t, n_s), v_node);
+        ggml_tensor * out = ggml_add(ctx, ggml_view_1d(ctx, cpy_node, n, 0), ggml_view_1d(ctx, qkv_sum, n, 0));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -9903,6 +10016,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_ssm_conv_chain(GGML_TYPE_F32, 4, 224, 4, n_s));
         for (int64_t n_t : {1, 128}) {
             test_cases.emplace_back(new test_ssm_conv_chain(GGML_TYPE_F32, 4, 6144, n_t, n_s)); // Qwen3.5 0.8B
+        }
+    }
+
+    // {head_dim, n_head}: a small shape and Qwen3.5 0.8B (d_inner 6144 = 3 x 16 x 128); n_t 1024 runs in token blocks
+    for (int64_t n_s : {1, 2}) {
+        for (int64_t n_t : {1, 128}) {
+            test_cases.emplace_back(new test_ssm_conv_chain_qk_norm(GGML_TYPE_F32, 4, 64, 2, n_t, n_s));
+            test_cases.emplace_back(new test_ssm_conv_chain_qk_norm(GGML_TYPE_F32, 4, 128, 16, n_t, n_s));
+        }
+    }
+    test_cases.emplace_back(new test_ssm_conv_chain_qk_norm(GGML_TYPE_F32, 4, 128, 16, 1024, 1));
+    // n_t < 8 keeps GATED_DELTA_NET on its exact path
+    for (int64_t n_t : {1, 4}) {
+        for (int64_t n_s : {1, 2}) {
+            test_cases.emplace_back(new test_ssm_conv_chain_qk_norm(GGML_TYPE_F32, 4, 128, 16, n_t, n_s, true));
         }
     }
 
