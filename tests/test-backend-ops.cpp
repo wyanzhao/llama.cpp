@@ -4605,6 +4605,66 @@ struct test_ssm_conv_chain_qk_norm : public test_case {
     }
 };
 
+// gated output norm of the gated delta net layers: RMS_NORM(x) * w * SILU(z), in build_norm_gated order
+struct test_rms_norm_mul_silu : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_t;
+    const int64_t n_s;
+    const int     z_src; // 0: input, 1: MUL_MAT between the norm and the SILU, 2: in-place write of x between them
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_SILU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        // z_src 1 has a MUL_MAT in the graph, which is not exact across backends
+        return z_src == 1 ? 5e-4 : 1e-7;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(head_dim, n_head, n_t, n_s, z_src);
+    }
+
+    test_rms_norm_mul_silu(int64_t head_dim = 128, int64_t n_head = 16, int64_t n_t = 4, int64_t n_s = 1, int z_src = 0)
+        : head_dim(head_dim), n_head(n_head), n_t(n_t), n_s(n_s), z_src(z_src) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_head, n_t, n_s);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        ggml_set_name(x, "x");
+        ggml_set_name(w, "w");
+
+        ggml_tensor * normed = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+
+        ggml_tensor * z = nullptr;
+        if (z_src == 1) {
+            // the z projection is built after the norm, so it lands between the norm and the SILU
+            const int64_t n_embd = 128;
+            ggml_tensor * wz  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, head_dim * n_head);
+            ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_t * n_s);
+            ggml_set_name(wz,  "wz");
+            ggml_set_name(cur, "cur");
+            z = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, wz, cur), head_dim, n_head, n_t, n_s);
+        } else if (z_src == 2) {
+            // an op between the norm and the SILU overwrites x: the norm must not move past it
+            ggml_tensor * c = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_head, n_t, n_s);
+            ggml_set_name(c, "c");
+            z = ggml_add_inplace(ctx, x, c);
+        } else {
+            z = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_head, n_t, n_s);
+            ggml_set_name(z, "z");
+        }
+
+        ggml_tensor * out = ggml_mul(ctx, normed, ggml_silu(ctx, z));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -10033,6 +10093,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_ssm_conv_chain_qk_norm(GGML_TYPE_F32, 4, 128, 16, n_t, n_s, true));
         }
     }
+    for (int z_src : {0, 1, 2}) {
+        for (int64_t n_t : {1, 128}) {
+            test_cases.emplace_back(new test_rms_norm_mul_silu(128, 16, n_t, 1, z_src));
+        }
+    }
+    test_cases.emplace_back(new test_rms_norm_mul_silu(128, 16, 1024, 2, 1));
+    test_cases.emplace_back(new test_rms_norm_mul_silu(72, 3, 5, 1, 0));
+    test_cases.emplace_back(new test_rms_norm_mul_silu(72, 3, 5, 1, 1));
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 32, 4)); // Mamba-2

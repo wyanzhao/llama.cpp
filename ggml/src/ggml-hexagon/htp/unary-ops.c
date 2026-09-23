@@ -36,6 +36,13 @@ typedef void (*unary_rms_norm_mul_compute_fn_t)(const void * restrict src,
                                                 uint32_t num_rows,
                                                 const struct htp_unary_context * uctx);
 
+typedef void (*unary_rms_norm_mul_silu_compute_fn_t)(const void * restrict src,
+                                                     const void * restrict weight,
+                                                     const void * restrict z,
+                                                     void * restrict dst,
+                                                     uint32_t num_rows,
+                                                     const struct htp_unary_context * uctx);
+
 typedef void (*unary_tri_compute_fn_t)(const void * restrict src,
                                        void * restrict dst,
                                        uint32_t num_rows,
@@ -63,6 +70,7 @@ struct htp_unary_context {
 
     dma_addr_t                data_src0;
     dma_addr_t                data_src1;            // weight/scale tensor for RMS_NORM_MUL
+    dma_addr_t                data_src2;            // gate tensor z for RMS_NORM_MUL_SILU
     dma_addr_t                data_dst;
 
     size_t                    src0_data_row_size;   // actual data bytes per row
@@ -71,10 +79,12 @@ struct htp_unary_context {
 
     size_t                    src0_row_size_aligned;
     size_t                    src1_row_size_aligned;
+    size_t                    src2_row_size_aligned;
     size_t                    dst_row_size_aligned;
 
     size_t                    src0_vtcm_half_size;
     size_t                    src1_vtcm_half_size;
+    size_t                    src2_vtcm_half_size;
     size_t                    dst_vtcm_half_size;
 
     uint32_t                  block;
@@ -87,10 +97,13 @@ struct htp_unary_context {
 
     uint8_t *                 vtcm_src0;
     uint8_t *                 vtcm_src1;
+    uint8_t *                 vtcm_src2;
+    uint8_t *                 vtcm_silu_scratch;    // one aligned row, RMS_NORM_MUL_SILU only
     uint8_t *                 vtcm_dst;
 
     size_t                    vtcm_src0_size_per_thread;
     size_t                    vtcm_src1_size_per_thread;
+    size_t                    vtcm_src2_size_per_thread;
     size_t                    vtcm_dst_size_per_thread;
 };
 
@@ -238,6 +251,36 @@ static void rms_norm_mul_f32(const void * restrict src,
         uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
 
         hvx_fast_rms_norm_mul_f32(src_local, w_local, dst_local, ne0, epsilon);
+    }
+}
+
+// RMS_NORM(x) * w * SILU(z): same helpers and operand order as rms_norm_mul_f32, silu_f32 and the binary MUL.
+// The SiLU scratch is the extra row at the end of this thread's z region.
+static void rms_norm_mul_silu_f32(const void * restrict src,
+                                  const void * restrict weight,
+                                  const void * restrict z,
+                                  void * restrict dst,
+                                  const uint32_t num_rows,
+                                  const struct htp_unary_context * uctx) {
+    htp_unary_op_preamble;
+    float epsilon = 0.f;
+    memcpy(&epsilon, op_params, sizeof(float));
+
+    uint8_t * restrict scratch = uctx->vtcm_silu_scratch;
+
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+        const size_t             w_off     = uctx->broadcast_weight ? 0 : ir * uctx->src1_row_size_aligned;
+        const uint8_t * restrict w_local   = (const uint8_t *)weight + w_off;
+        const uint8_t * restrict z_local   = (const uint8_t *)z + (ir * uctx->src2_row_size_aligned);
+        uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+        hvx_fast_rms_norm_mul_f32(src_local, w_local, dst_local, ne0, epsilon);
+
+        hvx_sigmoid_f32_aa(scratch, z_local, ne0);
+        hvx_mul_f32_aaa(scratch, z_local, scratch, ne0);
+
+        hvx_mul_f32_aaa(dst_local, dst_local, scratch, ne0);
     }
 }
 
@@ -950,7 +993,8 @@ static void unary_thread_row_block(unsigned int nth, unsigned int ith, void * da
     dma_queue_flush(dma_q);
 }
 
-// 2. RMS_NORM_MUL row-block task with weight buffer.
+// 2b. RMS_NORM_MUL_SILU row-block task: src0 and z (contiguous, same row size) are double buffered.
+// 2. RMS_NORM_MUL row-block task with weight buffer; RMS_NORM_MUL_SILU also stages z (src2).
 static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, void * data) {
     (void) nth;
     const struct htp_unary_context * uctx = (const struct htp_unary_context *) data;
@@ -995,6 +1039,22 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
     const size_t src0_vtcm_half_size = uctx->src0_vtcm_half_size;
     const size_t src1_vtcm_half_size = uctx->src1_vtcm_half_size;
     const size_t dst_vtcm_half_size  = uctx->dst_vtcm_half_size;
+
+    // RMS_NORM_MUL_SILU: z rows staged like src0, one SiLU scratch row after them
+    const bool       has_z     = octx->op == HTP_OP_RMS_NORM_MUL_SILU;
+    const dma_addr_t data_src2 = uctx->data_src2;
+    const uint32_t   nb21      = has_z ? octx->src[2]->nb[1] : 0;
+    const size_t     src2_row_size_aligned = uctx->src2_row_size_aligned;
+    const size_t     src2_vtcm_half_size   = uctx->src2_vtcm_half_size;
+    uint8_t *        src2_vtcm_data = has_z ? uctx->vtcm_src2 + (ith * uctx->vtcm_src2_size_per_thread) : NULL;
+
+    struct htp_unary_context lctx;
+    const struct htp_unary_context * cctx = uctx;
+    if (has_z) {
+        lctx = *uctx;
+        lctx.vtcm_silu_scratch = src2_vtcm_data + 2 * src2_vtcm_half_size;
+        cctx = &lctx;
+    }
 
     const bool src0_contig = (nb02 == (size_t)ne01 * nb01) &&
                              (nb03 == (size_t)ne02 * nb02);
@@ -1048,10 +1108,14 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
                 uctx->src1_row_size_aligned, nb11, uctx->src1_data_row_size, block_size);
         }
 
+        if (has_z) {
+            dma_queue_push(dma_q,
+                dma_make_data(src2_vtcm_data + (vtcm_idx * src2_vtcm_half_size), data_src2 + (size_t) ir * nb21),
+                src2_row_size_aligned, nb21, src0_data_row_size, block_size);
+        }
+
         ir += block_size;
     }
-
-    unary_rms_norm_mul_compute_fn_t compute = (unary_rms_norm_mul_compute_fn_t) uctx->compute;
 
     for (uint32_t ir = src0_start_row; ir < src0_end_row; ) {
         const uint32_t block_size = unary_block_size(ir, src0_end_row, BLOCK, block_src0_contig, block_dst_contig,
@@ -1063,10 +1127,15 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
         if (!uctx->broadcast_weight) {
             src1_vtcm = (void *) (uintptr_t) dma_queue_pop(dma_q).dst;
         }
+        void * src2_vtcm = has_z ? (void *) (uintptr_t) dma_queue_pop(dma_q).dst : NULL;
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ir);
         const void * w = uctx->broadcast_weight ? (const void *) src1_vtcm_data : src1_vtcm;
-        compute(src0_vtcm, w, dst_vtcm, block_size, uctx);
+        if (has_z) {
+            ((unary_rms_norm_mul_silu_compute_fn_t) uctx->compute)(src0_vtcm, w, src2_vtcm, dst_vtcm, block_size, cctx);
+        } else {
+            ((unary_rms_norm_mul_compute_fn_t) uctx->compute)(src0_vtcm, w, dst_vtcm, block_size, uctx);
+        }
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ir);
 
         const size_t dst_off = dst_contig ? (ir * nb1) :
@@ -1096,6 +1165,12 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
                     dma_queue_push(dma_q,
                         dma_make_data(src1_vtcm, data_src1 + src1_pref_off),
                         uctx->src1_row_size_aligned, nb11, uctx->src1_data_row_size, pref_block_size);
+                }
+
+                if (has_z) {
+                    dma_queue_push(dma_q,
+                        dma_make_data(src2_vtcm, data_src2 + (size_t) pref_ir * nb21),
+                        src2_row_size_aligned, nb21, src0_data_row_size, pref_block_size);
                 }
             }
         }
@@ -1471,6 +1546,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         case HTP_OP_NORM:            op_type = is_f16 ? "norm-f16"     : "norm-f32";         break;
         case HTP_OP_RMS_NORM:        op_type = is_f16 ? "rmsnorm-f16"  : "rmsnorm-f32";      break;
         case HTP_OP_RMS_NORM_MUL:    op_type = "rmsnorm-mul-f32";                            break;
+        case HTP_OP_RMS_NORM_MUL_SILU: op_type = "rmsnorm-mul-silu-f32";                      break;
         case HTP_OP_SCALE:           op_type = is_f16 ? "scale-f16"    : "scale-f32";        break;
         case HTP_OP_CLAMP:           op_type = is_f16 ? "clamp-f16"    : "clamp-f32";        break;
         case HTP_OP_LEAKY_RELU:      op_type = "leaky-relu-f32";                             break;
@@ -1555,10 +1631,13 @@ static int execute_op_unary(struct htp_ops_context * octx) {
 
     // RMS_NORM_MUL fusion is F32-only (its weight tensor is always F32; see
     // try_fuse_node()'s type guard), so this never triggers when is_f16 is true.
-    if (octx->op == HTP_OP_RMS_NORM_MUL) {
+    if (octx->op == HTP_OP_RMS_NORM_MUL || octx->op == HTP_OP_RMS_NORM_MUL_SILU) {
         src1 = octx->src[1];
         src1_data_row_size = src1->ne[0] * sizeof(float);
     }
+
+    // RMS_NORM_MUL_SILU: z (contiguous, shaped like src0) is staged with src0's row size
+    const struct htp_tensor * src2 = octx->op == HTP_OP_RMS_NORM_MUL_SILU ? octx->src[2] : NULL;
 
     if (octx->ctx->vtcm_size < (size_t)kparams->vtcm_size) {
         FARF(ERROR, "unary-%s : current VTCM reservation %zu is too small, needed %zu\n", op_type, octx->ctx->vtcm_size, (size_t)kparams->vtcm_size);
@@ -1582,7 +1661,8 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         .row_start             = row_start,
 
         .data_src0             = src0->data,
-        .data_src1             = (octx->op == HTP_OP_RMS_NORM_MUL) ? src1->data : 0,
+        .data_src1             = src1 ? src1->data : 0,
+        .data_src2             = src2 ? src2->data : 0,
         .data_dst              = dst->data,
 
         .src0_data_row_size    = src0_data_row_size,
@@ -1591,10 +1671,12 @@ static int execute_op_unary(struct htp_ops_context * octx) {
 
         .src0_row_size_aligned = src0_row_size_aligned,
         .src1_row_size_aligned = src1_row_size_aligned,
+        .src2_row_size_aligned = kparams->src2_row_size_aligned,
         .dst_row_size_aligned  = dst_row_size_aligned,
 
         .src0_vtcm_half_size   = kparams->vtcm_src0_size_per_thread / 2,
-        .src1_vtcm_half_size   = (octx->op == HTP_OP_RMS_NORM_MUL) ? (kparams->vtcm_src1_size_per_thread / (broadcast_weight ? 1 : 2)) : 0,
+        .src1_vtcm_half_size   = src1 ? (kparams->vtcm_src1_size_per_thread / (broadcast_weight ? 1 : 2)) : 0,
+        .src2_vtcm_half_size   = src2 ? (size_t) kparams->src2_row_size_aligned * kparams->vtcm_row_per_thread : 0,
         .dst_vtcm_half_size    = kparams->vtcm_dst_size_per_thread / 2,
 
         .block                 = kparams->block,
@@ -1604,10 +1686,15 @@ static int execute_op_unary(struct htp_ops_context * octx) {
 
         .vtcm_src0             = VTCM_LAYOUT_PTR(uint8_t, base, 0),
         .vtcm_src1             = VTCM_LAYOUT_PTR_OPTIONAL(uint8_t, base, kparams->vtcm_src0_size, kparams->vtcm_src1_size > 0),
+        .vtcm_src2             = VTCM_LAYOUT_PTR_OPTIONAL(uint8_t, base,
+                                     kparams->vtcm_src0_size + kparams->vtcm_src1_size + kparams->vtcm_dst_size,
+                                     kparams->vtcm_src2_size > 0),
+        .vtcm_silu_scratch     = NULL,
         .vtcm_dst              = VTCM_LAYOUT_PTR(uint8_t, base, kparams->vtcm_src0_size + kparams->vtcm_src1_size),
 
         .vtcm_src0_size_per_thread = kparams->vtcm_src0_size_per_thread,
         .vtcm_src1_size_per_thread = kparams->vtcm_src1_size_per_thread,
+        .vtcm_src2_size_per_thread = kparams->vtcm_src2_size_per_thread,
         .vtcm_dst_size_per_thread  = kparams->vtcm_dst_size_per_thread,
     };
 
@@ -1662,6 +1749,10 @@ static int execute_op_unary(struct htp_ops_context * octx) {
             case HTP_OP_RMS_NORM_MUL:
                 task_func    = unary_thread_rms_norm_mul_f32;
                 compute_func = (void *) rms_norm_mul_f32;
+                break;
+            case HTP_OP_RMS_NORM_MUL_SILU:
+                task_func    = unary_thread_rms_norm_mul_f32;
+                compute_func = (void *) rms_norm_mul_silu_f32;
                 break;
             case HTP_OP_SCALE:           compute_func = (void *) scale_f32;               break;
             case HTP_OP_CLAMP:           compute_func = (void *) clamp_f32;               break;

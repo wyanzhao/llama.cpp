@@ -108,6 +108,7 @@ enum htp_op_code {
     HTP_OP_MDEV_GROUP,
     HTP_OP_ROLL,
     HTP_OP_SSM_CONV_CHAIN,  // fused CONCAT + CPY + SSM_CONV + SILU
+    HTP_OP_RMS_NORM_MUL_SILU, // fused RMS_NORM(x) * w * SILU(z)
 
     HTP_OP_INVALID
 };
