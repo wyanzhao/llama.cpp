@@ -25,6 +25,7 @@ struct work_queue_task_s {
     void *            data;
     unsigned int      n_threads;
     atomic_uint       barrier;
+    unsigned int      seqn;      // value of q->seqn that publishes this task
 };
 
 // internal structure kept in thread-local storage per instance of work queue
@@ -55,6 +56,7 @@ static void work_queue_thread(void * context) {
     FARF(HIGH, "work-queue: thread %u started", me->id);
 
     unsigned int prev_seqn = 0;
+    unsigned int done_seqn = 0;  // seqn of the newest task this worker has handled
 
     while (!atomic_load_explicit(&q->killed, memory_order_relaxed)) {
         unsigned int seqn = atomic_load_explicit(&q->seqn, memory_order_acquire);
@@ -75,6 +77,13 @@ static void work_queue_thread(void * context) {
 
         while (ir != iw) {
             struct work_queue_task_s * task = &q->queue[ir];
+
+            // Skip a task this worker already ran: idx_read can still point at it if the next task was published between the seqn and index loads.
+            if ((int) (task->seqn - done_seqn) <= 0) {
+                ir = (ir + 1) & q->idx_mask;
+                continue;
+            }
+            done_seqn = task->seqn;
 
             unsigned int n = task->n_threads;
             unsigned int i = me->id;
@@ -113,6 +122,7 @@ bool work_queue_run_async(work_queue_t q, work_queue_func_t func, void * data, u
     task->func      = func;
     task->data      = data;
     task->n_threads = n;
+    task->seqn      = atomic_load_explicit(&q->seqn, memory_order_relaxed) + 1;
     atomic_store_explicit(&task->barrier, n, memory_order_relaxed);
 
     atomic_store_explicit(&q->idx_write, (iw + 1) & q->idx_mask, memory_order_relaxed);
