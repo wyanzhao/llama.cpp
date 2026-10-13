@@ -11885,6 +11885,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
 
+    // gate/up matmuls + split SWIGLU at prefill sizes (pipelined HMX plan on Hexagon): odd M tail, several column chunks
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (int64_t m_batch : {33, 64, 333, 1024}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m_batch, 4128, 2048,
+                false, 16, 8, false, false, true, false, { 1, 1 }));
+        }
+    }
+
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
             for (bool bias_probs : {false, true}) {
