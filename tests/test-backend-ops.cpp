@@ -8517,6 +8517,54 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// several sequences packed into one batch over one unified KV cache: each query row sees only the KV cells of its own
+// sequence (all of them, or causally the past plus the batch up to itself), so whole KV ranges are masked for a block
+// of rows
+struct test_flash_attn_ext_packed : public test_flash_attn_ext {
+    const int  n_seq;
+    const bool causal;
+
+    test_flash_attn_ext_packed(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+                               int n_seq, bool causal, ggml_type type_KV = GGML_TYPE_F16)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV),
+          n_seq(n_seq), causal(causal) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",n_seq=" + std::to_string(n_seq) + ",causal=" + std::to_string(causal);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        const int64_t n_kv = m->ne[0];
+        const int64_t n_q  = m->ne[1];
+
+        std::mt19937 gen(1234);
+        std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+
+        std::vector<float> data_f32(ggml_nelements(m), -INFINITY);
+        for (int64_t i3 = 0; i3 < m->ne[3]; i3++) {
+            for (int64_t s = 0; s < n_seq; s++) {
+                const int64_t q0 = s * n_q / n_seq,  q1 = (s + 1) * n_q / n_seq;
+                const int64_t c0 = s * n_kv / n_seq, c1 = (s + 1) * n_kv / n_seq;
+                for (int64_t i1 = q0; i1 < q1; i1++) {
+                    // the last q1 - q0 cells of the sequence hold its batch rows
+                    const int64_t c_end = causal ? c1 - (q1 - q0) + (i1 - q0) + 1 : c1;
+                    float * row = data_f32.data() + (i3 * n_q + i1) * n_kv;
+                    for (int64_t c = c0; c < c_end; c++) {
+                        row[c] = dis(gen);
+                    }
+                }
+            }
+        }
+
+        std::vector<ggml_fp16_t> data_f16(data_f32.size());
+        ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f16.size());
+        ggml_backend_tensor_set(m, data_f16.data(), 0, data_f16.size() * sizeof(ggml_fp16_t));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -11824,6 +11872,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(128, 128,  8, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // FLASH_ATTN_EXT: sequences packed into one batch (block-diagonal masks, whole KV ranges masked per block of rows)
+    test_cases.emplace_back(new test_flash_attn_ext_packed( 64,  64, 4, {1, 1}, 4096, 1024, 4, false));
+    test_cases.emplace_back(new test_flash_attn_ext_packed( 64,  64, 4, {2, 1}, 4096, 1024, 3, false));
+    test_cases.emplace_back(new test_flash_attn_ext_packed( 64,  64, 4, {2, 1}, 4096, 1024, 4, true));
+    test_cases.emplace_back(new test_flash_attn_ext_packed(128, 128, 4, {4, 1}, 4096,  512, 2, true));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
