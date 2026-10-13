@@ -333,6 +333,9 @@ struct htp_opformat {
                 path = "hvx-tiled";
             }
             snprintf(str, max_size, "%s vtcm %d", path, (int) kparams->vtcm_size);
+        } else if (node.opcode == HTP_OP_MUL_MAT_NX_GLU) {
+            const auto * kparams = (const struct htp_mm_kernel_params *) node.kernel_params;
+            snprintf(str, max_size, "hmx-glu vtcm %d", (int) kparams->vtcm_size);
         } else if (node.opcode == HTP_OP_FLASH_ATTN_EXT) {
             const auto * kparams = (const struct htp_fa_kernel_params *) node.kernel_params;
             const char * path = "unknown";
