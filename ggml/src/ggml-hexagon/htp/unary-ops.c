@@ -498,7 +498,7 @@ static void silu_f32(const void * restrict src,
 }
 
 // GELU uses the tanh approximation.
-static __attribute__((noinline)) HVX_Vector hvx_vec_gelu_f32(HVX_Vector x) {
+static inline HVX_Vector hvx_vec_gelu_f32(HVX_Vector x) {
     const HVX_Vector half = hvx_vec_splat_f32(0.5f);
     const HVX_Vector one  = hvx_vec_splat_f32(1.0f);
 
