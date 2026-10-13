@@ -311,7 +311,7 @@ static inline size_t htp_mm_round_up(size_t n, size_t m) {
 }
 
 static inline bool htp_mm_hmx_pipeline(uint32_t m) {
-    return m > 32;
+    return m > HTP_MM_HMX_MIN_NROWS;
 }
 
 static inline void htp_mm_hmx_get_2d_chunk_costs(
