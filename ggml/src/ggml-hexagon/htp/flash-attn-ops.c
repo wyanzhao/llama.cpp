@@ -1492,6 +1492,350 @@ static inline void fa_softmax_impl(
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_SFM, (uint16_t) (args->q_start * G + vec_start * 64));
 }
 
+// Softmax for a mask broadcast over heads without ALiBi or softcap: the same operations in the same order as
+// fa_softmax_impl(), but pass 1 decodes, masks and max-reduces the two S rows in one loop with the mask row
+// pointers computed once per row pair (and the mask values once when both rows read the same mask row).
+static inline __attribute__((always_inline)) void fa_softmax_mask_broadcast_impl(unsigned int n, unsigned int i, void * data, const bool is_g1) {
+    fa_softmax_args_t *     args  = (fa_softmax_args_t *) data;
+    struct hmx_fa_context * factx = args->factx;
+
+    const size_t n_rows_g       = args->n_rows_g;
+    const size_t kv_rows        = args->kv_rows;
+    const size_t Bc             = args->Bc;
+    const size_t G              = args->G;
+    const size_t n_row_vec_cnt  = hmx_ceil_div(n_rows_g, 64);
+
+    size_t vec_start = 0;
+    size_t vec_end   = n_row_vec_cnt;
+    if (n > 1) {
+        const size_t vecs_per_t = fastdiv(n_row_vec_cnt + n - 1, &args->thread_div);
+        vec_start = i * vecs_per_t;
+        vec_end   = hex_smin(vec_start + vecs_per_t, n_row_vec_cnt);
+    }
+
+    if (vec_start >= n_row_vec_cnt) {
+        return;
+    }
+
+    struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_SFM, (uint16_t) (args->q_start * G + vec_start * 64));
+
+    // Per-thread row scratch: thread i uses bufs at offset i * 2 * stride
+    const size_t row_buf_stride = factx->row_buf_stride;
+    HVX_Vector * my_row_buf0    = factx->vtcm_row_bufs + i * 2 * row_buf_stride;
+    HVX_Vector * my_row_buf1    = my_row_buf0 + row_buf_stride;
+
+    const HVX_Vector v_neg_inf   = Q6_Vh_vsplat_R(0xfbff);
+    const HVX_Vector v_threshold = Q6_Vh_vsplat_R(0xcc00);  // fp16 -16.0
+    const HVX_Vector v_log2e     = hvx_vec_splat_f16(EXP_LOG2E_F);
+
+    const __fp16 * const mask_vtcm        = args->mask_vtcm;
+    const size_t         mask_row_stride  = args->mask_vtcm_row_stride;
+    const size_t         n_full_chunks    = kv_rows / 64;
+    const size_t         tail_cols        = kv_rows % 64;
+
+    for (size_t r_vec_idx = vec_start; r_vec_idx < vec_end; ++r_vec_idx) {
+        HVX_Vector rowmax_acc_v = v_neg_inf;
+        HVX_Vector rowsum_acc_v = Q6_V_vzero();
+        HVX_Vector m_prev_v0    = factx->vtcm_m_vec[r_vec_idx * 2 + 0];
+        HVX_Vector m_prev_v1    = factx->vtcm_m_vec[r_vec_idx * 2 + 1];
+
+        for (uint32_t r_vec_off = 0; r_vec_off < 64; r_vec_off += 2) {
+            uint32_t r = r_vec_idx * 64 + r_vec_off;
+            if (r >= hex_align_up(n_rows_g, 2)) {
+                break;
+            }
+
+            uint32_t r0 = r / HMX_FP16_TILE_N_ROWS;
+            uint32_t r1 = r % HMX_FP16_TILE_N_ROWS;
+
+            const __fp16 * s_ld_base = factx->vtcm_s_tiles[args->buf_idx] + r0 * HMX_FP16_TILE_N_ROWS * Bc;
+            __fp16 *       p_st_base = factx->vtcm_p_tiles[args->buf_idx] + r0 * HMX_FP16_TILE_N_ROWS * Bc;
+
+            // ---- Pass 1 (fused): decode rows r, r+1 from S tiles, apply the mask, row max ----
+            const bool has_row1 = (r + 1 < n_rows_g);
+            size_t     qi0      = r;
+            size_t     qi1      = r + 1;
+            if (!is_g1) {
+                qi0 = fastdiv(r + 0, &factx->div_G);
+                qi1 = has_row1 ? fastdiv(r + 1, &factx->div_G) : qi0;
+            }
+            const HVX_Vector * pv_m0      = (const HVX_Vector *) (mask_vtcm + qi0 * mask_row_stride);
+            const HVX_Vector * pv_m1      = (const HVX_Vector *) (mask_vtcm + qi1 * mask_row_stride);
+            const HVX_Vector * pv_s       = ((const HVX_Vector *) s_ld_base) + r1 / 2;  // chunk ci: pv_s + ci * 32
+
+            HVX_Vector v_s_rowmax0 = v_neg_inf;
+            HVX_Vector v_s_rowmax1 = v_neg_inf;
+
+            if (has_row1 && (is_g1 || qi1 != qi0)) {
+                // two mask rows
+                for (size_t ci = 0; ci < n_full_chunks; ++ci) {
+                    HVX_VectorPair vp_s = Q6_W_vdeal_VVR(pv_s[ci * 32 + 16], pv_s[ci * 32], -2);
+                    HVX_Vector v_mask0 = pv_m0[ci];
+                    HVX_Vector v_mask1 = pv_m1[ci];
+                    HVX_VectorPred q_keep0 = Q6_Q_vcmp_gt_VhfVhf(v_mask0, v_threshold);
+                    HVX_VectorPred q_keep1 = Q6_Q_vcmp_gt_VhfVhf(v_mask1, v_threshold);
+                    HVX_Vector v_mask0_scaled = hvx_vec_mul_f16_f16(v_mask0, v_log2e);
+                    HVX_Vector v_mask1_scaled = hvx_vec_mul_f16_f16(v_mask1, v_log2e);
+                    HVX_Vector v_row0 = Q6_V_vmux_QVV(q_keep0, hvx_vec_add_f16_f16(Q6_V_lo_W(vp_s), v_mask0_scaled), v_neg_inf);
+                    HVX_Vector v_row1 = Q6_V_vmux_QVV(q_keep1, hvx_vec_add_f16_f16(Q6_V_hi_W(vp_s), v_mask1_scaled), v_neg_inf);
+                    my_row_buf0[ci] = v_row0;
+                    my_row_buf1[ci] = v_row1;
+                    v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, v_row0);
+                    v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, v_row1);
+                }
+                if (tail_cols) {
+                    const size_t   ci          = n_full_chunks;
+                    HVX_VectorPred q_tail_keep = Q6_Q_vsetq2_R(tail_cols * sizeof(__fp16));
+                    HVX_VectorPair vp_s = Q6_W_vdeal_VVR(pv_s[ci * 32 + 16], pv_s[ci * 32], -2);
+                    HVX_Vector v_mask0 = pv_m0[ci];
+                    HVX_Vector v_mask1 = pv_m1[ci];
+                    HVX_VectorPred q_keep0 = Q6_Q_and_QQ(Q6_Q_vcmp_gt_VhfVhf(v_mask0, v_threshold), q_tail_keep);
+                    HVX_VectorPred q_keep1 = Q6_Q_and_QQ(Q6_Q_vcmp_gt_VhfVhf(v_mask1, v_threshold), q_tail_keep);
+                    HVX_Vector v_mask0_scaled = hvx_vec_mul_f16_f16(v_mask0, v_log2e);
+                    HVX_Vector v_mask1_scaled = hvx_vec_mul_f16_f16(v_mask1, v_log2e);
+                    HVX_Vector v_row0 = Q6_V_vmux_QVV(q_keep0, hvx_vec_add_f16_f16(Q6_V_lo_W(vp_s), v_mask0_scaled), v_neg_inf);
+                    HVX_Vector v_row1 = Q6_V_vmux_QVV(q_keep1, hvx_vec_add_f16_f16(Q6_V_hi_W(vp_s), v_mask1_scaled), v_neg_inf);
+                    my_row_buf0[ci] = v_row0;
+                    my_row_buf1[ci] = v_row1;
+                    v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, v_row0);
+                    v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, v_row1);
+                }
+            } else if (has_row1) {
+                // both rows read the same mask row: same mask value, scaled value and keep predicate
+                for (size_t ci = 0; ci < n_full_chunks; ++ci) {
+                    HVX_VectorPair vp_s = Q6_W_vdeal_VVR(pv_s[ci * 32 + 16], pv_s[ci * 32], -2);
+                    HVX_Vector v_mask0 = pv_m0[ci];
+                    HVX_VectorPred q_keep0 = Q6_Q_vcmp_gt_VhfVhf(v_mask0, v_threshold);
+                    HVX_Vector v_mask0_scaled = hvx_vec_mul_f16_f16(v_mask0, v_log2e);
+                    HVX_Vector v_row0 = Q6_V_vmux_QVV(q_keep0, hvx_vec_add_f16_f16(Q6_V_lo_W(vp_s), v_mask0_scaled), v_neg_inf);
+                    HVX_Vector v_row1 = Q6_V_vmux_QVV(q_keep0, hvx_vec_add_f16_f16(Q6_V_hi_W(vp_s), v_mask0_scaled), v_neg_inf);
+                    my_row_buf0[ci] = v_row0;
+                    my_row_buf1[ci] = v_row1;
+                    v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, v_row0);
+                    v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, v_row1);
+                }
+                if (tail_cols) {
+                    const size_t   ci          = n_full_chunks;
+                    HVX_VectorPred q_tail_keep = Q6_Q_vsetq2_R(tail_cols * sizeof(__fp16));
+                    HVX_VectorPair vp_s = Q6_W_vdeal_VVR(pv_s[ci * 32 + 16], pv_s[ci * 32], -2);
+                    HVX_Vector v_mask0 = pv_m0[ci];
+                    HVX_VectorPred q_keep0 = Q6_Q_and_QQ(Q6_Q_vcmp_gt_VhfVhf(v_mask0, v_threshold), q_tail_keep);
+                    HVX_Vector v_mask0_scaled = hvx_vec_mul_f16_f16(v_mask0, v_log2e);
+                    HVX_Vector v_row0 = Q6_V_vmux_QVV(q_keep0, hvx_vec_add_f16_f16(Q6_V_lo_W(vp_s), v_mask0_scaled), v_neg_inf);
+                    HVX_Vector v_row1 = Q6_V_vmux_QVV(q_keep0, hvx_vec_add_f16_f16(Q6_V_hi_W(vp_s), v_mask0_scaled), v_neg_inf);
+                    my_row_buf0[ci] = v_row0;
+                    my_row_buf1[ci] = v_row1;
+                    v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, v_row0);
+                    v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, v_row1);
+                }
+            } else {
+                // last row of an odd row count: row r+1 does not exist and is fully masked (as in the generic path)
+                const size_t n_chunks = n_full_chunks + (tail_cols ? 1 : 0);
+                for (size_t ci = 0; ci < n_chunks; ++ci) {
+                    const size_t   ne          = hex_smin(kv_rows - ci * 64, 64);
+                    HVX_VectorPred q_tail_keep = Q6_Q_vsetq2_R(ne * sizeof(__fp16));
+                    HVX_VectorPair vp_s = Q6_W_vdeal_VVR(pv_s[ci * 32 + 16], pv_s[ci * 32], -2);
+                    HVX_Vector v_mask0 = pv_m0[ci];
+                    HVX_VectorPred q_keep0 = Q6_Q_and_QQ(Q6_Q_vcmp_gt_VhfVhf(v_mask0, v_threshold), q_tail_keep);
+                    HVX_Vector v_mask0_scaled = hvx_vec_mul_f16_f16(v_mask0, v_log2e);
+                    HVX_Vector v_row0 = Q6_V_vmux_QVV(q_keep0, hvx_vec_add_f16_f16(Q6_V_lo_W(vp_s), v_mask0_scaled), v_neg_inf);
+                    my_row_buf0[ci] = v_row0;
+                    my_row_buf1[ci] = v_neg_inf;
+                    v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, v_row0);
+                    v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, v_neg_inf);
+                }
+            }
+
+            v_s_rowmax0 = hvx_vec_reduce_max_f16(v_s_rowmax0);
+            v_s_rowmax1 = hvx_vec_reduce_max_f16(v_s_rowmax1);
+
+            // Splat m_prev[r], m_prev[r+1] from the float per-row accumulators and convert to fp16 vectors
+            HVX_Vector v_m_prev0, v_m_prev1;
+            if (r_vec_off < 32) {
+                HVX_Vector v0 = hvx_vec_repl_f32(Q6_V_vror_VR(m_prev_v0, r_vec_off * 4));
+                v_m_prev0 = hvx_vec_f32_to_f16(v0, v0);
+                if (r + 1 < n_rows_g) {
+                    HVX_Vector v1 = hvx_vec_repl_f32(Q6_V_vror_VR(m_prev_v0, (r_vec_off + 1) * 4));
+                    v_m_prev1 = hvx_vec_f32_to_f16(v1, v1);
+                } else {
+                    v_m_prev1 = Q6_V_vzero();
+                }
+            } else {
+                HVX_Vector v0 = hvx_vec_repl_f32(Q6_V_vror_VR(m_prev_v1, (r_vec_off - 32) * 4));
+                v_m_prev0 = hvx_vec_f32_to_f16(v0, v0);
+                if (r + 1 < n_rows_g) {
+                    HVX_Vector v1 = hvx_vec_repl_f32(Q6_V_vror_VR(m_prev_v1, (r_vec_off + 1 - 32) * 4));
+                    v_m_prev1 = hvx_vec_f32_to_f16(v1, v1);
+                } else {
+                    v_m_prev1 = Q6_V_vzero();
+                }
+            }
+
+            HVX_Vector v_dup_m0 = Q6_Vhf_vmax_VhfVhf(v_m_prev0, v_s_rowmax0);
+            HVX_Vector v_dup_m1 = Q6_Vhf_vmax_VhfVhf(v_m_prev1, v_s_rowmax1);
+
+            // Insert row r, r+1 rowmax into rowmax_acc_v
+            {
+                HVX_VectorPred p_start = Q6_Q_vsetq_R(r_vec_off * 2);
+                HVX_VectorPred p_mid   = Q6_Q_vsetq_R((r_vec_off + 1) * 2);
+                HVX_VectorPred p_end   = Q6_Q_vsetq2_R((r_vec_off + 2) * 2);
+                HVX_VectorPred p_lane0 = Q6_Q_and_QQn(p_mid, p_start);
+                HVX_VectorPred p_lane1 = Q6_Q_and_QQn(p_end, p_mid);
+                rowmax_acc_v           = Q6_V_vmux_QVV(p_lane0, v_dup_m0, rowmax_acc_v);
+                rowmax_acc_v           = Q6_V_vmux_QVV(p_lane1, v_dup_m1, rowmax_acc_v);
+            }
+
+            // Compute P = exp(S - m_new)
+            const HVX_Vector v_zero      = Q6_V_vzero();
+            HVX_Vector       v_p_rowsum0 = v_zero;
+            HVX_Vector       v_p_rowsum1 = v_zero;
+
+            size_t c = 0;
+            for (; c + 64 < kv_rows; c += 128) {
+                size_t     ci0          = c / 64;
+                size_t     ci1          = ci0 + 1;
+
+                HVX_Vector v_s_minus_m0_0 = Q6_Vqf16_vsub_VhfVhf(my_row_buf0[ci0], v_dup_m0);
+                HVX_Vector v_s_minus_m1_0 = Q6_Vqf16_vsub_VhfVhf(my_row_buf1[ci0], v_dup_m1);
+                HVX_Vector v_s_minus_m0_1 = Q6_Vqf16_vsub_VhfVhf(my_row_buf0[ci1], v_dup_m0);
+                HVX_Vector v_s_minus_m1_1 = Q6_Vqf16_vsub_VhfVhf(my_row_buf1[ci1], v_dup_m1);
+
+                HVX_Vector v_p_row0_hf_0  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0_0));
+                HVX_Vector v_p_row1_hf_0  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1_0));
+                HVX_Vector v_p_row0_hf_1  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0_1));
+                HVX_Vector v_p_row1_hf_1  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1_1));
+
+                __fp16 *     out_dtile0  = p_st_base + ci0 * HMX_FP16_TILE_N_ELMS * 2;
+                __fp16 *     out_dtile1  = p_st_base + ci1 * HMX_FP16_TILE_N_ELMS * 2;
+                HVX_Vector * pv_p_out0_0  = ((HVX_Vector *) out_dtile0) + r1 / 2;
+                HVX_Vector * pv_p_out1_0  = pv_p_out0_0 + 16;
+                HVX_Vector * pv_p_out0_1  = ((HVX_Vector *) out_dtile1) + r1 / 2;
+                HVX_Vector * pv_p_out1_1  = pv_p_out0_1 + 16;
+
+                HVX_VectorPair vp_p_dual0 = Q6_W_vshuff_VVR(v_p_row1_hf_0, v_p_row0_hf_0, -2);
+                *pv_p_out0_0               = Q6_V_lo_W(vp_p_dual0);
+                *pv_p_out1_0               = Q6_V_hi_W(vp_p_dual0);
+
+                HVX_VectorPair vp_p_dual1 = Q6_W_vshuff_VVR(v_p_row1_hf_1, v_p_row0_hf_1, -2);
+                *pv_p_out0_1               = Q6_V_lo_W(vp_p_dual1);
+                *pv_p_out1_1               = Q6_V_hi_W(vp_p_dual1);
+
+                HVX_VectorPair vp_p0_0 = hvx_vec_f16_to_f32_shuff(v_p_row0_hf_0);
+                HVX_VectorPair vp_p1_0 = hvx_vec_f16_to_f32_shuff(v_p_row1_hf_0);
+                HVX_VectorPair vp_p0_1 = hvx_vec_f16_to_f32_shuff(v_p_row0_hf_1);
+                HVX_VectorPair vp_p1_1 = hvx_vec_f16_to_f32_shuff(v_p_row1_hf_1);
+
+                v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum0, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p0_0), Q6_V_hi_W(vp_p0_0)));
+                v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum0, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p0_1), Q6_V_hi_W(vp_p0_1)));
+                v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum1, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p1_0), Q6_V_hi_W(vp_p1_0)));
+                v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum1, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p1_1), Q6_V_hi_W(vp_p1_1)));
+            }
+            for (size_t c_rem = c; c_rem < kv_rows; c_rem += 64) {
+                size_t     ci           = c_rem / 64;
+                HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(my_row_buf0[ci], v_dup_m0);
+                HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(my_row_buf1[ci], v_dup_m1);
+
+                HVX_Vector v_p_row0_hf  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0));
+                HVX_Vector v_p_row1_hf  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1));
+                __fp16 *     out_dtile  = p_st_base + ci * HMX_FP16_TILE_N_ELMS * 2;
+                HVX_Vector * pv_p_out0  = ((HVX_Vector *) out_dtile) + r1 / 2;
+                HVX_Vector * pv_p_out1  = pv_p_out0 + 16;
+
+                HVX_VectorPair vp_p_dual = Q6_W_vshuff_VVR(v_p_row1_hf, v_p_row0_hf, -2);
+                *pv_p_out0               = Q6_V_lo_W(vp_p_dual);
+                *pv_p_out1               = Q6_V_hi_W(vp_p_dual);
+
+                HVX_VectorPair vp_p0 = hvx_vec_f16_to_f32_shuff(v_p_row0_hf);
+                HVX_VectorPair vp_p1 = hvx_vec_f16_to_f32_shuff(v_p_row1_hf);
+
+                v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum0, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p0), Q6_V_hi_W(vp_p0)));
+                v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum1, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p1), Q6_V_hi_W(vp_p1)));
+            }
+
+            HVX_Vector rowsum0_sf = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(v_p_rowsum0));
+            HVX_Vector rowsum1_sf = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(v_p_rowsum1));
+            {
+                HVX_Vector rv0_v = hvx_vec_f32_to_f16(rowsum0_sf, rowsum0_sf);
+                HVX_Vector rv1_v = hvx_vec_f32_to_f16(rowsum1_sf, rowsum1_sf);
+
+                HVX_VectorPred p_start = Q6_Q_vsetq_R(r_vec_off * 2);
+                HVX_VectorPred p_mid   = Q6_Q_vsetq_R((r_vec_off + 1) * 2);
+                HVX_VectorPred p_end   = Q6_Q_vsetq2_R((r_vec_off + 2) * 2);
+                HVX_VectorPred p_lane0 = Q6_Q_and_QQn(p_mid, p_start);
+                HVX_VectorPred p_lane1 = Q6_Q_and_QQn(p_end, p_mid);
+                rowsum_acc_v           = Q6_V_vmux_QVV(p_lane0, rv0_v, rowsum_acc_v);
+                rowsum_acc_v           = Q6_V_vmux_QVV(p_lane1, rv1_v, rowsum_acc_v);
+            }
+        }
+
+        // Inline fa_ml_update_and_build_d for this vector (lock-free and in parallel)
+        HVX_VectorPair rowmax_acc_pair    = hvx_vec_f16_to_f32(rowmax_acc_v);
+        HVX_Vector     v_rowmax_acc_f32_0 = Q6_V_lo_W(rowmax_acc_pair);
+        HVX_Vector     v_rowmax_acc_f32_1 = Q6_V_hi_W(rowmax_acc_pair);
+
+        HVX_Vector v_m_curr0 = Q6_Vsf_vmax_VsfVsf(m_prev_v0, v_rowmax_acc_f32_0);
+        HVX_Vector v_m_curr1 = Q6_Vsf_vmax_VsfVsf(m_prev_v1, v_rowmax_acc_f32_1);
+
+        HVX_Vector v_m_diff0 = HVX_OP_SUB_F32(m_prev_v0, v_m_curr0);
+        HVX_Vector v_m_diff1 = HVX_OP_SUB_F32(m_prev_v1, v_m_curr1);
+
+        HVX_Vector v_m_diff_f16   = hvx_vec_f32_to_f16(v_m_diff0, v_m_diff1);
+        HVX_Vector exp_m_diff_f16 = hvx_vec_exp2_f16(v_m_diff_f16);
+
+        HVX_VectorPair exp_m_diff_pair = hvx_vec_f16_to_f32(exp_m_diff_f16);
+        HVX_Vector exp_m_diff0 = Q6_V_lo_W(exp_m_diff_pair);
+        HVX_Vector exp_m_diff1 = Q6_V_hi_W(exp_m_diff_pair);
+
+        HVX_VectorPair rowsum_acc_pair = hvx_vec_f16_to_f32(rowsum_acc_v);
+        HVX_Vector     v_rowsum_acc_f32_0 = Q6_V_lo_W(rowsum_acc_pair);
+        HVX_Vector     v_rowsum_acc_f32_1 = Q6_V_hi_W(rowsum_acc_pair);
+
+        HVX_Vector v_l_curr0;
+        HVX_Vector v_l_curr1;
+        if (args->kv_start == 0 && factx->sinks != NULL) {
+            // First KV block with sinks: m_prev holds the seeded sink value (not -inf),
+            // so exp_m_diff = exp2(sink - m_curr) is the sink's contribution to the
+            // denominator. l_prev is 0 here, so add exp_m_diff directly instead of
+            // multiplying the (uninitialized) l_prev term.
+            v_l_curr0 = HVX_OP_ADD_F32(exp_m_diff0, v_rowsum_acc_f32_0);
+            v_l_curr1 = HVX_OP_ADD_F32(exp_m_diff1, v_rowsum_acc_f32_1);
+        } else {
+            HVX_Vector l_prev_v0 = factx->vtcm_l_vec[r_vec_idx * 2 + 0];
+            HVX_Vector l_prev_v1 = factx->vtcm_l_vec[r_vec_idx * 2 + 1];
+            v_l_curr0 = HVX_OP_ADD_F32(HVX_OP_MUL_F32(l_prev_v0, exp_m_diff0), v_rowsum_acc_f32_0);
+            v_l_curr1 = HVX_OP_ADD_F32(HVX_OP_MUL_F32(l_prev_v1, exp_m_diff1), v_rowsum_acc_f32_1);
+        }
+
+        factx->vtcm_m_vec[r_vec_idx * 2 + 0] = v_m_curr0;
+        factx->vtcm_m_vec[r_vec_idx * 2 + 1] = v_m_curr1;
+        factx->vtcm_l_vec[r_vec_idx * 2 + 0] = v_l_curr0;
+        factx->vtcm_l_vec[r_vec_idx * 2 + 1] = v_l_curr1;
+
+        // Build diagonal tile D = diag(exp(m_diff))
+        const HVX_Vector     v_offsets = *(const HVX_Vector *) d_tile_scatter_offsets;
+        const HVX_VectorPred q_32_mask = Q6_Q_vsetq_R(32 * sizeof(__fp16));
+        HVX_Vector           v_exp_m_diff = exp_m_diff_f16;
+
+        __fp16 * const d_tiles_out = factx->vtcm_d_tiles[args->buf_idx];
+
+        size_t t0 = r_vec_idx * 2;
+        if (t0 < args->n_row_tiles) {
+            const HVX_Vector v_content = v_exp_m_diff;
+            __fp16 *         out_base  = d_tiles_out + t0 * HMX_FP16_TILE_N_ELMS;
+            Q6_vscatter_QRMVhV(q_32_mask, (size_t) out_base, HMX_FP16_TILE_SIZE - 1, v_offsets, v_content);
+        }
+
+        size_t t1 = r_vec_idx * 2 + 1;
+        if (t1 < args->n_row_tiles) {
+            const HVX_Vector v_content = Q6_V_vror_VR(v_exp_m_diff, 64);
+            __fp16 *         out_base  = d_tiles_out + t1 * HMX_FP16_TILE_N_ELMS;
+            Q6_vscatter_QRMVhV(q_32_mask, (size_t) out_base, HMX_FP16_TILE_SIZE - 1, v_offsets, v_content);
+        }
+    }
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_SFM, (uint16_t) (args->q_start * G + vec_start * 64));
+}
+
 static void fa_softmax_thread_nomask(unsigned int n, unsigned int i, void * data) {
     fa_softmax_impl(n, i, data,
                     /*has_mask=*/false,
@@ -1502,21 +1846,11 @@ static void fa_softmax_thread_nomask(unsigned int n, unsigned int i, void * data
 }
 
 static void fa_softmax_thread_mask_broadcast_g1(unsigned int n, unsigned int i, void * data) {
-    fa_softmax_impl(n, i, data,
-                    /*has_mask=*/true,
-                    /*mask_broadcast=*/true,
-                    /*is_g1=*/true,
-                    /*has_alibi=*/false,
-                    /*has_softcap=*/false);
+    fa_softmax_mask_broadcast_impl(n, i, data, /*is_g1=*/true);
 }
 
 static void fa_softmax_thread_mask_broadcast_gn(unsigned int n, unsigned int i, void * data) {
-    fa_softmax_impl(n, i, data,
-                    /*has_mask=*/true,
-                    /*mask_broadcast=*/true,
-                    /*is_g1=*/false,
-                    /*has_alibi=*/false,
-                    /*has_softcap=*/false);
+    fa_softmax_mask_broadcast_impl(n, i, data, /*is_g1=*/false);
 }
 
 static void fa_softmax_thread(unsigned int n, unsigned int i, void * data) {
